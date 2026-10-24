@@ -1,0 +1,26 @@
+# 默认忽略根目录内容，只跟踪明确列出的源码和文档。
+/*
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/BOT5-2-414 .py
+!/面板4-11.py
+!/start_bot_chrome.bat
+!/一键配置环境修正413.bat
+
+!/bot_core/
+/bot_core/*
+!/bot_core/*.py
+!/bot_core/README.txt
+
+!/tests/
+/tests/*
+!/tests/*.py
+!/tests/*.cjs
+
+!/maintenance/
+/maintenance/*
+!/maintenance/*.py
+
+# 日志、账户数据、运行控制、浏览器配置、虚拟环境及维修备份不入库。
+# 新增源码目录时，请显式增加允许规则。
