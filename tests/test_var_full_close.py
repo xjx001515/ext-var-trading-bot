@@ -149,6 +149,7 @@ def environment(directory):
     env['_exec_positions_confirmed_empty']=lambda page,cfg:bool(page.flat)
     env['_exec_read_portfolio_snapshot']=lambda page,cfg,**k:{'available':True,'positions':dict(page.positions)}
     names={'_var_full_close_guarded','_run_full_close_transaction','_full_close_read_var_coins',
+           '_full_close_confirm_var_absence',
            '_full_close_dismiss_dialog','_full_close_recover_page','_exec_global_close_report',
            '_safety_confirm_flat_scope','_safety_resolve_submission'}
     load_definitions(names,env)
@@ -232,6 +233,49 @@ class FullCloseReplayTests(unittest.TestCase):
         self.assertTrue(close_flow.submission_summary(reports)['pending'])
         self.assertEqual(self.env['_safety_submission_records']()['VAR|TIA|CLOSE|SHORT']['state'],'PENDING_CONFIRM')
         self.env['_full_close_recover_page'].assert_not_called()
+
+    def test_submitted_coin_disappears_while_other_positions_remain(self):
+        self.varpage.positions['LTC']={'side':'SHORT','qty_abs':5,'notional_u':300}
+        calls=[]
+        def close(coin):
+            calls.append(coin)
+            self.env['_safety_reserve_submission']('VAR',coin,'SHORT','close_all',self.varpage.positions[coin],100)
+            self.flow.record_attempt(dict(id=coin,platform='VAR',coin=coin,state='CLICKED'))
+            self.confirm(coin)
+            return False  # Old per-coin reader cannot confirm absence with another row present.
+        self.var.close_all=close
+        reports=self.run_close()
+        self.assertEqual(calls,['TIA','LTC']);self.assertTrue(reports['VAR']['ok'])
+        self.assertEqual(self.env['_safety_submission_records']()['VAR|TIA|CLOSE|SHORT']['state'],'CONFIRMED_SUCCESS')
+        self.env['_full_close_recover_page'].assert_not_called()
+
+    def test_prior_coin_close_is_settled_without_resubmission_then_other_coins_close(self):
+        self.env['_safety_reserve_submission']('VAR','LTC','SHORT','close_all',
+            {'side':'SHORT','qty_abs':5,'notional_u':300},300)
+        self.var.close_all=Mock(side_effect=self.confirm)
+        reports=self.run_close()
+        self.var.close_all.assert_called_once_with('TIA')
+        self.assertTrue(reports['VAR']['ok'])
+        self.assertEqual(self.env['_safety_submission_records']()['VAR|LTC|CLOSE|SHORT']['state'],'CONFIRMED_SUCCESS')
+
+    def test_pending_global_close_still_prevents_any_duplicate_coin_order(self):
+        self.env['_safety_reserve_submission']('VAR','ALL','','close_all',None,0)
+        self.var.close_all=Mock()
+        reports=self.run_close()
+        self.var.close_all.assert_not_called();self.assertFalse(reports['VAR']['ok'])
+
+    def test_absence_confirmation_rejects_transient_or_unreadable_table(self):
+        self.env['_safety_reserve_submission']('VAR','LTC','SHORT','close_all',
+            {'side':'SHORT','qty_abs':5,'notional_u':300},300)
+        self.flow.mark_unknown('VAR','LTC','submitted')
+        for values in ([['TIA'],['TIA','LTC']],[['TIA'],['GRASS']],
+                       [['TIA'],TimeoutError('table unavailable')]):
+            self.env['_full_close_read_var_coins']=Mock(side_effect=values)
+            with close_flow.scope(self.flow):
+                try:result=self.env['_full_close_confirm_var_absence'](self.var,'LTC',self.flow)
+                except TimeoutError:result=False
+            self.assertFalse(result)
+            self.assertEqual(self.env['_safety_submission_records']()['VAR|LTC|CLOSE|SHORT']['state'],'PENDING_CONFIRM')
 
     def test_global_failure_logs_exact_platform_and_real_coins(self):
         self.var.close_all=Mock(return_value=False)

@@ -12902,6 +12902,30 @@ def _full_close_read_var_coins(exe):
     return found
 
 
+def _full_close_confirm_var_absence(exe, coin, flow):
+    """Confirm a submitted coin disappeared from two complete platform reads."""
+    samples = []
+    for attempt in range(2):
+        flow.check()
+        current = sorted(_full_close_read_var_coins(exe))
+        if str(coin).upper() in current:
+            return False
+        samples.append(current)
+        if attempt == 0:
+            time.sleep(.25)
+    if samples[0] != samples[1]:
+        return False  # A changing/partial table needs another independent observation.
+    flow.check()
+    empty = {'position_state': 'CONFIRMED_EMPTY', 'side': 'NONE', 'qty_abs': 0.0,
+             'notional_u': 0.0, 'reason': 'two_complete_var_tables_coin_absent'}
+    if not _safety_resolve_submission('VAR', coin, empty, kind='close_all'):
+        return False
+    flow.mark_result('VAR', coin, True, 'two_complete_var_tables_coin_absent')
+    safe_log(lambda: f"[{now_ts()}] [FULL_CLOSE_COIN_CONFIRMED] platform=VAR coin={coin} "
+             f"reason=two_complete_var_tables_coin_absent remaining_coins={samples[-1]} resubmitted=0")
+    return True
+
+
 def _full_close_dismiss_dialog(page, coin, flow):
     """Cancel only the unsubmitted close dialog; never send a global Escape."""
     if not flow.can_resubmit('VAR', coin) or _safety_pending_scope('VAR', coin, 'close_all'):
@@ -12963,11 +12987,17 @@ def _var_full_close_guarded(exe, dry_run=False):
         with _close_flow.scope(_close_flow.CloseFlow(assert_live=_WORKER_STATE.assert_live)):
             return _var_full_close_guarded(exe, dry_run=dry_run)
     flow.begin('VAR', 'ALL')
-    if _safety_pending_scope('VAR', 'ALL', 'close_all'):
+    from bot_core import submission_scope as scope
+    blocker = _safety_pending_scope('VAR', 'ALL', 'close_all')
+    pending = [dict(r) for r in _safety_submission_records().values()
+               if scope.blocks(r, 'VAR', 'ALL', 'close_all')]
+    if blocker and (not pending or any(r.get('coin') == 'ALL' for r in pending)):
         if _exec_positions_confirmed_empty(exe.page, VAR):
             return True
         flow.mark_unknown('VAR', 'ALL', 'existing_close_unconfirmed')
         return False
+    for record in pending:
+        flow.mark_unknown('VAR', record['coin'], 'existing_coin_close_unconfirmed')
     try:
         coins = _full_close_read_var_coins(exe)
     except Exception as exc:
@@ -12978,6 +13008,12 @@ def _var_full_close_guarded(exe, dry_run=False):
     flow.coins['VAR'] = list(coins)
     if dry_run:
         return True
+    for record in pending:
+        if record['coin'] not in coins:
+            try:
+                _full_close_confirm_var_absence(exe, record['coin'], flow)
+            except Exception:
+                flow.assert_owner_live()  # Unavailable evidence never releases a claim.
     for coin in coins:
         flow.check()
         flow.begin('VAR', coin)
@@ -12990,6 +13026,12 @@ def _var_full_close_guarded(exe, dry_run=False):
         except Exception as exc:
             flow.assert_owner_live()
             error = repr(exc)
+        if not ok and flow.submitted('VAR', coin):
+            try:
+                ok = _full_close_confirm_var_absence(exe, coin, flow)
+            except Exception as exc:
+                flow.assert_owner_live()
+                error = error or repr(exc)
         if not ok and _safety_pending_scope('VAR', coin, 'close_all'):
             flow.mark_unknown('VAR', coin, 'existing_close_unconfirmed_no_retry')
         if not ok and flow.can_resubmit('VAR', coin):
@@ -81560,10 +81602,6 @@ class _VarExecutor:
         """
         _exec_log(f"VAR（平台）全局一键全平开始 dry_run（模拟）={dry_run}")
         _pin_exec_reduce_phase(plat="VAR", coin="ALL", step="UI_GLOBAL_CLOSE_FLOW_BEGIN", action="close_all", extra={"mode": "close_all_global"})
-        if _safety_pending_scope('VAR', 'ALL', 'close_all'):
-            _exec_positions_confirmed_empty(self.page, VAR)
-            if _safety_pending_scope('VAR', 'ALL', 'close_all'):
-                return False
         _exec_ensure_active_page(self.page, "VAR（平台）全局一键全平")
         return _var_full_close_guarded(self, dry_run=dry_run)
 
