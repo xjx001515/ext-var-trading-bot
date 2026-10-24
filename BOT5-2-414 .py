@@ -36,6 +36,7 @@ from bot_core.browser_runtime import SessionLiveness as _SessionLiveness, ExtRec
 from contextlib import contextmanager
 from bot_core import m10_guard as _m10_guard
 from bot_core import postcheck_lifecycle as _postcheck_lifecycle
+from bot_core import close_flow as _close_flow
 from bot_core import margin_guard as _margin_guard
 from bot_core.execution_confirmation import apply_submission_evidence as _apply_submission_evidence
 import os as _os
@@ -7634,11 +7635,15 @@ def _pw_guard(*, mod: str = "SYS", coin: str = "", plat: str = "", act: str = ""
         elif _pw_runtime_is_recovering(plat):
             _reason = "runtime_recovering"
         elif _PW_SESSIONS.current_alive():
+            if globals().get('_EXEC_WORKER_LOCAL') is not None:
+                _EXEC_WORKER_LOCAL.pw_guard_reason = ''
             return True
         else:
             _reason = "playwright_not_alive"
     except Exception:
         _reason = "playwright_not_alive"
+    if globals().get('_EXEC_WORKER_LOCAL') is not None:
+        _EXEC_WORKER_LOCAL.pw_guard_reason = _reason
     try:
         _pin("PW_ALIVE_BLOCK", mod=str(mod or ""), coin=str(coin or ""), ok=0,
              reason=str(_reason or "playwright_not_alive"), plat=str(plat or ""), act=str(act or ""), stage=str(stage or ""))
@@ -9794,10 +9799,11 @@ def _pw_is_closed(page: Any) -> bool:
 
 def _pw_require_page(page: Any, where: str) -> None:
     if not _pw_guard(mod="SYS", coin="", plat="", act="", stage=str(where or "PW_REQUIRE_PAGE")):
-        raise _UiDeadError(where, "runtime_recovering" if _pw_runtime_is_recovering() else "playwright_not_alive")
+        raise _UiDeadError(where, getattr(globals().get('_EXEC_WORKER_LOCAL'), 'pw_guard_reason', '') or ("runtime_recovering" if _pw_runtime_is_recovering() else "playwright_not_alive"))
     if _pw_is_closed(page):
         try:
-            _pw_runtime_hard_reset(f"{str(where or 'PW_REQUIRE_PAGE')}|page_is_closed_or_none", source="SYS", touch_scan=False)
+            if getattr(globals().get('_close_flow'), 'current', lambda: None)() is None:
+                _pw_runtime_hard_reset(f"{str(where or 'PW_REQUIRE_PAGE')}|page_is_closed_or_none", source="SYS", touch_scan=False)
         except Exception as _e:
             _record_swallowed_exception('except_pass_line_126', _e)
             pass
@@ -10055,8 +10061,11 @@ def _pw_call(where: str, fn, *args, **kwargs):
     # A timed-out call already in flight cannot be interrupted;
     # prohibit every subsequent wrapped UI operation from that retired task.
     _WORKER_STATE.assert_live()
+    _close_ctx = getattr(globals().get('_close_flow'), 'current', lambda: None)()
+    if _close_ctx is not None:
+        _close_ctx.check()
     if not _pw_guard(mod="SYS", coin="", plat="", act="", stage=str(where or "PW_CALL")):
-        raise _UiDeadError(where, "runtime_recovering" if _pw_runtime_is_recovering() else "playwright_not_alive")
+        raise _UiDeadError(where, getattr(globals().get('_EXEC_WORKER_LOCAL'), 'pw_guard_reason', '') or ("runtime_recovering" if _pw_runtime_is_recovering() else "playwright_not_alive"))
     _operation_timeout_ms = int(kwargs.pop('_operation_timeout_ms', 0) or 0)
     try:
         _timeout_auto = _pw_call_timeout_ms(where=str(where or ''), fn=fn, kwargs=kwargs)
@@ -10065,6 +10074,8 @@ def _pw_call(where: str, fn, *args, **kwargs):
             kwargs.setdefault('timeout', int(_timeout_auto))
     except Exception:
         pass
+    if _close_ctx is not None and 'timeout' in kwargs:
+        kwargs['timeout'] = _close_ctx.timeout_ms(kwargs['timeout'])
     try:
         kwargs = _browser_supported_kwargs(fn, kwargs)
         import inspect as _inspect
@@ -10102,7 +10113,7 @@ def _pw_call(where: str, fn, *args, **kwargs):
         # Late TargetClosed/UI errors must not reset the successor runtime.
         _WORKER_STATE.assert_live()
         _exec_stage_probe("PW_CALL_FAIL", str(where or ""), err=f"{type(e).__name__}:{e}"[:240])
-        if _is_target_closed_exc(e):
+        if _is_target_closed_exc(e) and _close_ctx is None:
             try:
                 _pw_runtime_hard_reset(f"{str(where or 'PW_CALL')}|target_closed", source="SYS", touch_scan=False)
             except Exception as _e:
@@ -10111,7 +10122,8 @@ def _pw_call(where: str, fn, *args, **kwargs):
             raise _UiDeadError(where, repr(e)) from e
         if _is_link_error_exc(e):
             try:
-                _ui_link_err_hit(where, e)
+                if _close_ctx is None:
+                    _ui_link_err_hit(where, e)
             except Exception as _e:
                 _record_swallowed_exception('except_pass_line_134', _e)
                 pass
@@ -12090,11 +12102,11 @@ def _install_playwright_runtime_guards() -> bool:
             return True
         def _wrapped(self, *args, **kwargs):
             if not _pw_guard(mod="SYS", coin="", plat="", act=_name, stage=_stage):
-                raise _UiDeadError(_stage, "runtime_recovering" if _pw_runtime_is_recovering() else "playwright_not_alive")
+                raise _UiDeadError(_stage, getattr(globals().get('_EXEC_WORKER_LOCAL'), 'pw_guard_reason', '') or ("runtime_recovering" if _pw_runtime_is_recovering() else "playwright_not_alive"))
             try:
                 return _orig(self, *args, **kwargs)
             except Exception as _e:
-                if _is_target_closed_exc(_e):
+                if _is_target_closed_exc(_e) and getattr(globals().get('_close_flow'), 'current', lambda: None)() is None:
                     try:
                         _pw_runtime_hard_reset(f"{_stage}|target_closed", source="SYS", touch_scan=False)
                     except Exception as _e:
@@ -12103,7 +12115,8 @@ def _install_playwright_runtime_guards() -> bool:
                     raise _UiDeadError(_stage, repr(_e)) from _e
                 if _is_link_error_exc(_e):
                     try:
-                        _ui_link_err_hit(_stage, _e)
+                        if getattr(globals().get('_close_flow'), 'current', lambda: None)() is None:
+                            _ui_link_err_hit(_stage, _e)
                     except Exception as _e:
                         _record_swallowed_exception('except_pass_line_175', _e)
                         pass
@@ -12682,11 +12695,22 @@ def _safety_confirm_flat_scope(plat):
         if changed:
             _safety_submission_save()
 
-def _safety_click_submit_once(locator, timeout_ms, desc, *, before_click=None, on_result=None):
+def _safety_click_submit_once(locator, timeout_ms, desc, *, before_click=None, on_result=None, ready_wait_ms=0, on_blocked=None):
     try:
         _pw_call('safety.submit.wait_visible:' + str(desc), locator.wait_for, state='visible', timeout=timeout_ms)
-        if callable(getattr(locator, 'is_enabled', None)) and not _pw_call('safety.submit.enabled:' + str(desc), locator.is_enabled, timeout=timeout_ms):
-            return False
+        if callable(getattr(locator, 'is_enabled', None)):
+            if ready_wait_ms > 0:
+                from bot_core import close_flow
+                ready, detail = close_flow.wait_ready(locator, _pw_call,
+                    timeout_ms=min(timeout_ms, ready_wait_ms),
+                    assert_live=lambda: globals()['_WORKER_STATE'].assert_live() if globals().get('_WORKER_STATE') else None,
+                    sample=lambda: _pw_call('close.ready.sample', locator.evaluate, close_flow.CLOSE_DIALOG_SAMPLE_JS, timeout=800))
+                if not ready:
+                    if on_blocked is not None:
+                        on_blocked(detail)
+                    return False
+            elif not _pw_call('safety.submit.enabled:' + str(desc), locator.is_enabled, timeout=timeout_ms):
+                return False
         def dispatch(**kwargs):
             # No durable pending record until all pre-click checks and the
             # Playwright/worker guard have passed for this actual dispatch.
@@ -12762,6 +12786,9 @@ def _submit_attempt_set(order, state, reason='', **detail):
     if not isinstance(attempt, dict):
         attempt = _submit_attempt_begin(order)
     attempt.update(state=state, reason=str(reason), **detail)
+    ctx = getattr(order, '_close_flow_context', None)
+    if ctx is not None:
+        ctx.record_attempt(attempt)
     return attempt
 
 
@@ -12829,7 +12856,11 @@ def _submit_order_click(locator, order, platform, side, pre_row, usd, timeout_ms
     def completed(ok):
         _submit_attempt_set(order, 'CLICKED' if ok else 'CLICK_UNKNOWN',
             'submit_clicked' if ok else 'submit_click_outcome_unknown')
-    ok = _safety_click_submit_once(locator, timeout_ms, desc, before_click=reserve, on_result=completed)
+    def blocked(detail):
+        _submit_attempt_set(order, 'BLOCKED', detail.get('reason') or 'close_button_not_ready', readiness=detail)
+        safe_log(lambda: f"[{now_ts()}] [CLOSE_NOT_SUBMITTED] platform={platform} coin={getattr(order, 'coin', '')} detail={detail}")
+    ok = _safety_click_submit_once(locator, timeout_ms, desc, before_click=reserve, on_result=completed,
+        ready_wait_ms=int(getattr(order, '_close_ready_wait_ms', 0) or 0), on_blocked=blocked)
     if not ok and attempt.get('state') == 'NOT_ATTEMPTED':
         _submit_attempt_set(order, 'BLOCKED', 'submit_click_fail')
     return ok
@@ -12839,11 +12870,203 @@ def _submit_close_click(locator, platform, coin, side, pre_row, usd, timeout_ms,
     from types import SimpleNamespace
     req = getattr(globals().get('_ACTIVE_EXEC_CTX'), 'req_ref', None)
     rd = _req_get_dict(req) if req is not None else {}
+    close_ctx = getattr(globals().get('_close_flow'), 'current', lambda: None)()
     tracking = SimpleNamespace(platform=platform, coin=coin, side=side, usd=usd,
         module=str(rd.get('module') or 'EXEC'), action_type='close_all', reduce_only=True,
-        _exec_req_ref=req, _submission_kind='close_all')
+        _exec_req_ref=req, _submission_kind='close_all',
+        _close_flow_context=close_ctx, _close_ready_wait_ms=3000 if close_ctx is not None else 0)
     _submit_attempt_begin(tracking)
     return _submit_order_click(locator, tracking, platform, side, pre_row, usd, timeout_ms, desc)
+
+
+def _full_close_read_var_coins(exe):
+    _WORKER_STATE.assert_live()
+    _exec_ensure_active_page(exe.page, 'VAR full close positions')
+    _var_prepare_positions_view(exe.page, force=True)
+    rows = exe.page.locator(VAR['rows'])
+    count = int(_pw_call('full_close.VAR.rows_count', rows.count))
+    if count == 0:
+        if _exec_positions_confirmed_empty(exe.page, VAR):
+            return []
+        raise RuntimeError('VAR_positions_unavailable_zero_without_empty_evidence')
+    hrefs = _pw_call('full_close.VAR.markets',
+        exe.page.locator(f"{VAR['rows']} a.link-instrument").evaluate_all,
+        "els => els.map(e => e.getAttribute('href') || '')", timeout=1500)
+    found = []
+    for href in hrefs:
+        match = re.search(r'/perpetual/([A-Za-z0-9_-]+)(?:[/?#]|$)', str(href))
+        if match and match[1].upper() not in found:
+            found.append(match[1].upper())
+    if not found or len(found) != count:
+        raise RuntimeError(f'VAR_positions_coverage_unavailable:rows={count}|coins={len(found)}')
+    return found
+
+
+def _full_close_dismiss_dialog(page, coin, flow):
+    """Cancel only the unsubmitted close dialog; never send a global Escape."""
+    if not flow.can_resubmit('VAR', coin) or _safety_pending_scope('VAR', coin, 'close_all'):
+        return False
+    dialogs = page.locator('dialog[open], [role="dialog"]')
+    if int(_pw_call('full_close.VAR.dialogs', dialogs.count)) == 0:
+        return True
+    owned = dialogs.filter(has=page.locator('button[data-testid="close-position-button"]'))
+    if int(_pw_call('full_close.VAR.close_dialogs', owned.count)) != 1:
+        return False
+    dialog = owned.first
+    cancel = dialog.get_by_role('button', name=re.compile(r'^(Cancel|取消)$', re.I))
+    if int(_pw_call('full_close.VAR.cancel_count', cancel.count)) != 1:
+        return False
+    _pw_call('full_close.VAR.cancel_unsubmitted_dialog', cancel.click, timeout=800)
+    _pw_call('full_close.VAR.cancel_hidden', dialog.wait_for, state='hidden', timeout=1000)
+    return True
+
+
+def _full_close_recover_page(exe, platform, coin, flow):
+    """Recovery stays on the live owning worker and preserves the existing browser."""
+    flow.check()
+    if not flow.can_resubmit(platform, coin) or _safety_pending_scope(platform, coin, 'close_all'):
+        return False
+    rt = _exec_runtime_cache_get()
+    if not _exec_runtime_connection_alive(rt):
+        return False  # A retired worker or dead connection cannot be revived here.
+    _PW_SESSIONS.begin(rt['browser'])
+    page = exe.page
+    try:
+        if not page.is_closed():
+            _pw_call('full_close.recover.' + platform, page.reload,
+                     wait_until='domcontentloaded', timeout=flow.timeout_ms(10000))
+        else:
+            cfg = EXT if platform == 'EXT' else VAR
+            url = (str(cfg.get('open_url') or EXT_NORMAL_OPEN_URL) if platform == 'EXT'
+                   else 'https://omni.variational.io/perpetual/' + (coin if coin != 'ALL' else 'BTC'))
+            page, reason = _rebuild_single_page_in_context(rt['context'], target_url=url,
+                platform=platform, coin=coin, expected_url_keywords=[('extended.exchange' if platform == 'EXT' else 'variational.io')],
+                timeout_ms=flow.timeout_ms(15000))
+            if page is None:
+                raise RuntimeError(reason or 'close_page_recovery_failed')
+        flow.check()
+        exe.page = page
+        rt[platform.lower() + '_page'] = page
+        rt[platform.lower() + '_exe'] = exe
+        _exec_runtime_cache_set(rt)
+        safe_log(lambda: f"[{now_ts()}] EXEC_INROUND_RETRY platform={platform} coin={coin} reason=confirmed_no_submit_page_recovered attempt=1")
+        return True
+    except Exception as exc:
+        flow.assert_owner_live()
+        safe_log(lambda: f"[{now_ts()}] [FULL_CLOSE_RECOVERY_FAIL] platform={platform} coin={coin} error={exc!r} retry_exhausted=1")
+        return False
+
+
+def _var_full_close_guarded(exe, dry_run=False):
+    flow = _close_flow.current()
+    if flow is None:
+        with _close_flow.scope(_close_flow.CloseFlow(assert_live=_WORKER_STATE.assert_live)):
+            return _var_full_close_guarded(exe, dry_run=dry_run)
+    flow.begin('VAR', 'ALL')
+    if _safety_pending_scope('VAR', 'ALL', 'close_all'):
+        if _exec_positions_confirmed_empty(exe.page, VAR):
+            return True
+        flow.mark_unknown('VAR', 'ALL', 'existing_close_unconfirmed')
+        return False
+    try:
+        coins = _full_close_read_var_coins(exe)
+    except Exception as exc:
+        flow.assert_owner_live()
+        if not flow.recover_once('VAR', 'ALL', lambda: _full_close_recover_page(exe, 'VAR', 'ALL', flow)):
+            raise
+        coins = _full_close_read_var_coins(exe)
+    flow.coins['VAR'] = list(coins)
+    if dry_run:
+        return True
+    for coin in coins:
+        flow.check()
+        flow.begin('VAR', coin)
+        if _safety_pending_scope('VAR', coin, 'close_all') or flow.submitted('VAR', coin):
+            flow.mark_unknown('VAR', coin, 'close_already_submitted_no_retry')
+            continue
+        ok, error = False, ''
+        try:
+            ok = bool(exe.close_all(coin))
+        except Exception as exc:
+            flow.assert_owner_live()
+            error = repr(exc)
+        if not ok and _safety_pending_scope('VAR', coin, 'close_all'):
+            flow.mark_unknown('VAR', coin, 'existing_close_unconfirmed_no_retry')
+        if not ok and flow.can_resubmit('VAR', coin):
+            dismissed = False
+            try:
+                dismissed = _full_close_dismiss_dialog(exe.page, coin, flow)
+            except Exception as exc:
+                flow.assert_owner_live()
+                error = error or repr(exc)
+            if flow.recover_once('VAR', coin, lambda: _full_close_recover_page(exe, 'VAR', coin, flow)):
+                # Recheck the durable close claim after recovery, before re-entering.
+                if not _safety_pending_scope('VAR', coin, 'close_all'):
+                    try:
+                        ok = bool(exe.close_all(coin))
+                    except Exception as exc:
+                        flow.assert_owner_live()
+                        error = repr(exc)
+                if not ok and flow.can_resubmit('VAR', coin):
+                    try:
+                        dismissed = _full_close_dismiss_dialog(exe.page, coin, flow)
+                    except Exception:
+                        dismissed = False
+            if not ok and _safety_pending_scope('VAR', coin, 'close_all'):
+                flow.mark_unknown('VAR', coin, 'existing_close_unconfirmed_no_retry')
+            if not ok and not dismissed:
+                flow.mark_result('VAR', coin, False, error or 'unsubmitted_close_dialog_still_open')
+                break  # Do not navigate through an unresolved modal six times.
+        flow.mark_result('VAR', coin, ok, error or ('confirmed_empty' if ok else 'close_not_confirmed'))
+        if not ok and flow.submitted('VAR', coin):
+            break  # Delivery is uncertain: observe later, never replay this order.
+    flow.check()
+    return bool(_exec_positions_confirmed_empty(exe.page, VAR))
+
+
+def _run_full_close_transaction(ext_exe, var_exe, req, coins):
+    """Only this request's current worker may submit; final evidence gates the anchor."""
+    flow = _close_flow.current()
+    if flow is None:
+        with _close_flow.scope(_close_flow.CloseFlow(clock=getattr(time, 'monotonic', time.time), assert_live=_WORKER_STATE.assert_live)):
+            return _run_full_close_transaction(ext_exe, var_exe, req, coins)
+    _active_req_bind(req, stage='FULL_CLOSE_BEGIN')
+    done, errors = {'EXT': False, 'VAR': False}, {'EXT': '', 'VAR': ''}
+    for platform, exe in (('EXT', ext_exe), ('VAR', var_exe)):
+        try:
+            flow.begin(platform, 'ALL')
+            done[platform] = bool(exe.close_all_global())
+            if not done[platform] and flow.can_resubmit(platform, 'ALL'):
+                if flow.recover_once(platform, 'ALL', lambda: _full_close_recover_page(exe, platform, 'ALL', flow)):
+                    done[platform] = bool(exe.close_all_global())
+        except Exception as exc:
+            flow.assert_owner_live()
+            errors[platform] = repr(exc)
+            if not flow.submitted(platform, 'ALL') and flow.remaining() > 3:
+                try:
+                    if flow.recover_once(platform, 'ALL', lambda: _full_close_recover_page(exe, platform, 'ALL', flow)):
+                        done[platform] = bool(exe.close_all_global())
+                        errors[platform] = ''
+                except Exception as retry_exc:
+                    flow.assert_owner_live()
+                    errors[platform] = repr(retry_exc)
+    flow.final_verification = True
+    flow.assert_owner_live()
+    reports = {}
+    for platform, exe in (('EXT', ext_exe), ('VAR', var_exe)):
+        if flow.remaining() <= 0:
+            errors[platform] = errors[platform] or 'full_close_deadline_exhausted'
+        reports[platform] = _exec_global_close_report(exe, platform, done[platform],
+            coins=flow.coins[platform] or coins, error=errors[platform])
+        if reports[platform]['ok']:
+            flow.mark_result(platform, 'ALL', True, 'fresh_platform_empty')
+        reports[platform]['close_attempts'] = flow.details(platform)
+        reports[platform]['recovery_used'] = platform in flow.recovered
+    flow.assert_owner_live()
+    if flow.remaining() <= 0:
+        for report in reports.values():
+            report.update(ok=False, reason='full_close_deadline_exhausted')
+    return reports
 
 def _extract_position_snapshot_from_text(*, platform_name: str, market_txt: str = '', side_txt: str = '', value_txt: str = '') -> dict:
     """把平台行文本统一解析成 coin/side/qty_abs/notional_u。
@@ -34395,7 +34618,10 @@ def _executor_coin_worker_profile(requests: list | None, *, batch_name: str = "E
         worker_scope = 'default'
         worker_coin = ''
     timeout_sec = float(_executor_batch_timeout_for_requests(reqs, batch_name=batch_name, worker_name=worker_name))
-    if worker_scope == 'coin':
+    from bot_core.close_flow import is_full_close_batch, OUTER_SECONDS
+    if is_full_close_batch(reqs):
+        timeout_sec = OUTER_SECONDS
+    elif worker_scope == 'coin':
         timeout_sec = float(timeout_sec + 8.0)
     elif worker_scope == 'batch' and len(uniq) >= 2:
         timeout_sec = float(timeout_sec + min(20.0, 4.0 * max(0, len(uniq) - 1)))
@@ -34475,7 +34701,8 @@ def _executor_batch_timeout_for_requests(requests: list | None, *, batch_name: s
 
 def _executor_worker_handoff_needed(requests, *, batch_name: str, default_worker: str) -> bool:
     _WORKER_STATE.assert_live()
-    if not _has_running_asyncio_loop():
+    from bot_core.close_flow import is_full_close_batch
+    if not _has_running_asyncio_loop() and not is_full_close_batch(requests):
         return False
     profile = _executor_coin_worker_profile(requests, batch_name=batch_name)
     worker_key = str((profile or {}).get('worker_name') or default_worker)
@@ -81326,12 +81553,10 @@ class _VarExecutor:
         return True
 
     def close_all_global(self, dry_run: bool = False) -> bool:
-        """VAR（平台）全局一键全平：点击持仓区 Close All，再点击弹窗里的红色 Close All。
+        """逐币复用持仓行平仓；全局明确空仓证据才算成功。
 
-        仅供 ANCHOR / force_close_all 使用。
-        - 入口元素：<button class="text-red ...">Close All</button>
-        - 确认元素：弹窗里的红色 Close All
-        - 成功判据：持仓表行数归 0；若一开始就无持仓，也视为成功
+        仅供 ANCHOR / force_close_all 使用，共享固定时限和提交证据，
+        页面恢复与重试仅限尚未提交的范围。
         """
         _exec_log(f"VAR（平台）全局一键全平开始 dry_run（模拟）={dry_run}")
         _pin_exec_reduce_phase(plat="VAR", coin="ALL", step="UI_GLOBAL_CLOSE_FLOW_BEGIN", action="close_all", extra={"mode": "close_all_global"})
@@ -81340,144 +81565,7 @@ class _VarExecutor:
             if _safety_pending_scope('VAR', 'ALL', 'close_all'):
                 return False
         _exec_ensure_active_page(self.page, "VAR（平台）全局一键全平")
-
-        try:
-            # [PATCH] 去掉 'div:has-text("Positions")'：其 .first 是整页容器，按钮缺失时会点到页面中间
-            _safe_click_first(self.page, [
-                'button:has-text("Positions")',
-                'span:has-text("Positions")',
-            ], timeout_ms=1500)
-        except Exception:
-            pass
-
-        def _rows_count() -> int:
-            try:
-                return int(self.page.locator(VAR["rows"]).count() or 0)
-            except Exception:
-                return -1
-
-        pre_rows = _rows_count()
-        trigger = None
-        trigger_sel = ''
-        for sel in [
-            r'button.text-red.hover\:text-red\/90.focus\:text-red\/90:has-text("Close All")',
-            'button:has-text("Close All")',
-        ]:
-            try:
-                loc = self.page.locator(sel).first
-                if loc.count() <= 0:
-                    continue
-                if _exec_safe_wait_visible(loc, 1200, f"VAR（平台）全局一键全平候选 | {sel}"):
-                    trigger = loc
-                    trigger_sel = sel
-                    break
-            except Exception:
-                continue
-        # [PATCH] 新版 VAR 的 Close All 确认弹窗没核对过，而行内逐币单平已实测可用 -> 一律走逐币单平
-        if trigger is not None:
-            _exec_log(f"VAR（平台）全局一键全平：找到 Close All（{trigger_sel}），但确认弹窗未核对，改走逐币单平")
-            trigger = None
-        if trigger is None:
-            if pre_rows == 0 and _exec_positions_confirmed_empty(self.page, VAR):
-                _exec_log("VAR（平台）全局一键全平：未找到 Close All，但当前持仓行为 0 -> 视为已全平")
-                _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome="end", reason="already_flat_no_trigger", extra={"mode": "close_all_global"})
-                return True
-            # [PATCH] VAR 改版后持仓区已无 Close All 按钮：退化为逐币单平（走已核对的行内 title="Close" + close-position-button 流程）
-            _fb_coins: list = []
-            try:
-                _hrefs = self.page.locator(f'{VAR["rows"]} a.link-instrument').evaluate_all("els => els.map(e => e.getAttribute('href') || '')")
-                for _h in (_hrefs or []):
-                    _m = re.search(r"/perpetual/([A-Za-z0-9_\-]+)", str(_h or ''))
-                    if _m:
-                        _c = str(_m.group(1)).upper()
-                        if _c not in _fb_coins:
-                            _fb_coins.append(_c)
-            except Exception as _e_fb:
-                _record_swallowed_exception('var_close_all_global_fallback_coins', _e_fb)
-            _exec_log(f"VAR（平台）全局一键全平：未找到 Close All 入口（新版无此按钮），改为逐币单平 | rows={pre_rows} coins={_fb_coins}")
-            if not _fb_coins:
-                _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome="fail", reason="global_close_all_trigger_not_found", extra={"mode": "close_all_global", "pre_rows": int(pre_rows)})
-                return False
-            _fb_ok = True
-            for _c in _fb_coins:
-                try:
-                    if not bool(self.close_all(_c, dry_run=dry_run)):
-                        _fb_ok = False
-                except Exception as _e_fb2:
-                    _fb_ok = False
-                    _record_swallowed_exception('var_close_all_global_fallback_close', _e_fb2, coin=_c)
-            if dry_run:
-                return bool(_fb_ok)
-            _post_rows_fb = _rows_count()
-            _done_fb = bool(_fb_ok and _post_rows_fb == 0 and _exec_positions_confirmed_empty(self.page, VAR))
-            _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome=("end" if _done_fb else "fail"), reason=("global_fallback_per_coin_rows_zero" if _done_fb else "global_fallback_per_coin_incomplete"), extra={"mode": "close_all_global", "pre_rows": int(pre_rows), "post_rows": int(_post_rows_fb), "coins": list(_fb_coins)})
-            return _done_fb
-
-        if dry_run:
-            _exec_log(f"VAR（平台）全局一键全平 dry_run：已定位入口 sel={trigger_sel}")
-            return True
-        if not _exec_safe_click(trigger, 4000, f"VAR（平台）点击全局 Close All | {trigger_sel}"):
-            _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome="fail", reason="global_close_all_trigger_click_fail", extra={"mode": "close_all_global", "selector": str(trigger_sel or '')[:160]})
-            return False
-
-        dialog = None
-        for sel in [
-            '[role="dialog"]:has-text("Close All")',
-            'div:has-text("Total Positions"):has-text("Slippage Limit")',
-            'div:has-text("Close All"):has-text("Total Positions")',
-        ]:
-            try:
-                loc = self.page.locator(sel).first
-                if loc.count() <= 0:
-                    continue
-                if _exec_safe_wait_visible(loc, 1800, f"VAR（平台）全局一键全平确认弹窗 | {sel}"):
-                    dialog = loc
-                    break
-            except Exception:
-                continue
-        if dialog is None:
-            _exec_log("VAR（平台）全局一键全平：未等到确认弹窗")
-            _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome="fail", reason="global_close_all_dialog_not_found", extra={"mode": "close_all_global"})
-            return False
-
-        confirm = None
-        confirm_sel = ''
-        for sel in [
-            'button:has-text("Close All")',
-            'button:has(span:has-text("Close All"))',
-        ]:
-            try:
-                b = dialog.locator(sel).last
-                if b.count() <= 0:
-                    continue
-                if _exec_safe_wait_visible(b, 1800, f"VAR（平台）全局一键全平确认按钮 | {sel}"):
-                    confirm = b
-                    confirm_sel = sel
-                    break
-            except Exception:
-                continue
-        if confirm is None:
-            _exec_log("VAR（平台）全局一键全平：确认按钮未找到")
-            _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome="fail", reason="global_close_all_confirm_not_found", extra={"mode": "close_all_global"})
-            return False
-        if not _submit_close_click(confirm, 'VAR', 'ALL', '', None, 0.0, 5000, f"VAR（平台）点击全局确认按钮 | {confirm_sel}"):
-            _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome="fail", reason="global_close_all_confirm_click_fail", extra={"mode": "close_all_global", "selector": str(confirm_sel or '')[:160]})
-            return False
-
-        for _ in range(16):
-            try:
-                time.sleep(0.5)
-            except Exception:
-                pass
-            post_rows = _rows_count()
-            if post_rows == 0 and _exec_positions_confirmed_empty(self.page, VAR):
-                _exec_log("VAR（平台）全局一键全平成功：持仓表行数已归 0")
-                _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome="end", reason="global_postcheck_rows_zero", extra={"mode": "close_all_global", "pre_rows": int(pre_rows), "post_rows": int(post_rows)})
-                return True
-        post_rows = _rows_count()
-        _exec_log(f"VAR（平台）全局一键全平未确认成功：post_rows={post_rows}")
-        _pin_exec_flow_terminal(flow="close", plat="VAR", coin="ALL", action="close_all", outcome="fail", reason="global_postcheck_rows_not_zero", extra={"mode": "close_all_global", "pre_rows": int(pre_rows), "post_rows": int(post_rows)})
-        return False
+        return _var_full_close_guarded(self, dry_run=dry_run)
 
     def close_all(self, coin: str, dry_run: bool = False) -> bool:
         """VAR（平台）全平（CloseAll（全平））：只允许点“持仓列表（Positions（持仓））”里对应币种行的 Close（平仓）按钮，
@@ -81506,7 +81594,7 @@ class _VarExecutor:
                 return False
         _exec_ensure_active_page(self.page, "VAR（平台）全平")
 
-        if coin:
+        if coin and getattr(globals().get('_close_flow'), 'current', lambda: None)() is None:
             if not _exec_goto_coin_var(self.page, coin, self.timeout_ms, allow_goto=True, ctx="VAR_CLOSE_ALL", exec_privilege=True, privilege_reason="var_close_all"):
                 _pin_exec_flow_terminal(flow="close", plat="VAR", coin=coin, action="close_all", outcome="fail", reason="goto_coin_fail", extra={"mode": "close_all"})
                 return False
@@ -81568,6 +81656,8 @@ class _VarExecutor:
                 rows = self.page.locator(VAR["rows"])
                 row_count = rows.count()
             except Exception as _e:
+                if getattr(globals().get('_close_flow'), 'current', lambda: None)() is not None:
+                    raise  # Unavailable is never a zero-row position read.
                 try:
                     _log_exc_level(mod="EXEC", stage="VAR_CLOSE_ALL_ROWS_COUNT_FAIL", level="B", e=_e, coin=coin, plat="VAR")
                 except Exception as _e:
@@ -81745,10 +81835,8 @@ class _VarExecutor:
         confirm_sel = ""
         for sel in (
             'button[data-testid="close-position-button"]',
-            'button:has-text("Close Position")',
-            'button:has(span:has-text("Close Position"))',
-            '[role="dialog"] button:has-text("Close")',
-            '[role="dialog"] button:has-text("Confirm")',
+            'dialog[open] button:has-text("Close Position")',
+            '[role="dialog"] button:has-text("Close Position")',
         ):
             try:
                 cand = self.page.locator(sel).first
@@ -81818,15 +81906,9 @@ class _VarExecutor:
                 _pin_exec_flow_terminal(flow="close", plat="VAR", coin=coin, action="close_all", outcome="fail", reason="confirm_close_click_fail", extra={"mode": "close_all"})
                 return False
         else:
-            try:
-                if True:  # No verified confirmation target: do not click a generic dialog.
-                    _exec_log("VAR（平台）未找到平仓确认按钮/对话框，放弃本次全平", coin=coin)
-                    _pin_exec_flow_terminal(flow="close", plat="VAR", coin=coin, action="close_all", outcome="fail", reason="confirm_dialog_not_found", extra={"mode": "close_all"})
-                    return False
-            except Exception:
-                _exec_log("VAR（平台）平仓确认对话框兜底失败，放弃本次全平", coin=coin)
-                _pin_exec_flow_terminal(flow="close", plat="VAR", coin=coin, action="close_all", outcome="fail", reason="confirm_dialog_fallback_fail", extra={"mode": "close_all"})
-                return False
+            _exec_log("VAR（平台）未找到平仓确认按钮/对话框，放弃本次全平", coin=coin)
+            _pin_exec_flow_terminal(flow="close", plat="VAR", coin=coin, action="close_all", outcome="fail", reason="confirm_dialog_not_found", extra={"mode": "close_all"})
+            return False
 
         _pin_exec_reduce_phase(plat="VAR", coin=coin, step="UI_WAIT_SUBMIT_EVIDENCE_BEGIN", action="close_all", extra={"mode": "close_all"})
         try:
@@ -86485,6 +86567,15 @@ def _anchor_bootstrap_runtime(total_u: float, *, reason: str = "startup_total_u"
     - 本次运行启动完成后，后续仍只允许锚点上移，不允许下降；
     - 触发全平成功后，再把锚点抬到本次触发时的 total_u。
     """
+    if str(os.environ.get('BOT_CONTROLLED_RESTART_RESUME', '')).lower() in ('1', 'true', 'yes'):
+        import math
+        saved = _load_anchor_state()
+        anchor = float((saved or {}).get('anchor_u') or 0.0)
+        if not (anchor > 0 and math.isfinite(anchor)):
+            raise RuntimeError('controlled_restart_anchor_missing')
+        globals()['_ANCHOR_RUNTIME_BOOTSTRAPPED'] = True
+        globals()['_ANCHOR_RUNTIME_START_ANCHOR_U'] = anchor
+        return anchor
     try:
         tu = float(total_u or 0.0)
     except Exception:
@@ -95678,15 +95769,21 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
             _record_swallowed_exception('except_pass_line_1509', _e)
             pass
         try:
+            from bot_core import close_flow as _close_worker
+            _close_clock = getattr(time, 'monotonic', time.time)
+            _close_deadline = _close_clock() + _close_worker.WORK_SECONDS
             _res = _run_call_in_worker_thread(
-                lambda: executor_run_quanbu(cdp, log_path, snapshot, requests, coins=coins, exec_modules=exec_modules,
-                                            max_orders=max_orders, max_notional_u=max_notional_u,
-                                            pre_reload_times=pre_reload_times),
+                lambda: _close_worker.invoke(
+                    lambda: executor_run_quanbu(cdp, log_path, snapshot, requests, coins=coins, exec_modules=exec_modules,
+                                                max_orders=max_orders, max_notional_u=max_notional_u,
+                                                pre_reload_times=pre_reload_times),
+                    requests, _close_deadline, clock=_close_clock, assert_live=_WORKER_STATE.assert_live),
                 thread_name=_worker_name,
                 timeout_sec=_timeout_sec,
                 logfp=log_path,
                 mod="EXECUTOR",
                 on_timeout_rebuild=True,
+                deadline_monotonic=(_close_deadline + 5.0) if _close_worker.is_full_close_batch(requests) else None,
             )
             _dispatch_release_state = 'DONE'
             _dispatch_release_reason = 'worker_ok'
@@ -97232,50 +97329,11 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                             except Exception:
                                 coins_list = []
 
-                        retry_max = int(globals().get("ANCHOR_RETRY_MAX", 3) or 3)
-                        backoff = globals().get("ANCHOR_RETRY_BACKOFF", [1, 2, 3, 5, 8])
-
-                        ok_all = True
+                        close_platforms = _run_full_close_transaction(ext_exe, var_exe, req, coins_list)
+                        ext_page, var_page = ext_exe.page, var_exe.page
+                        ext_done = bool(close_platforms['EXT']['ok'])
+                        var_done = bool(close_platforms['VAR']['ok'])
                         per_coin = []
-                        ext_done = False
-                        var_done = False
-                        fail_reason = ""
-                        close_errors = {'EXT': '', 'VAR': ''}
-                        for i in range(max(1, retry_max)):
-                            try:
-                                if not ext_done:
-                                    ext_done = bool(ext_exe.close_all_global())
-                                    close_errors['EXT'] = ''
-                            except Exception as e:
-                                ext_done = False
-                                fail_reason = f"ext_global_close_all_exc:{repr(e)}"
-                                close_errors['EXT'] = repr(e)
-                            try:
-                                if not var_done:
-                                    var_done = bool(var_exe.close_all_global())
-                                    close_errors['VAR'] = ''
-                            except Exception as e:
-                                var_done = False
-                                close_errors['VAR'] = repr(e)
-                                if not fail_reason:
-                                    fail_reason = f"var_global_close_all_exc:{repr(e)}"
-                            if ext_done and var_done:
-                                break
-                            try:
-                                s = backoff[i] if i < len(backoff) else backoff[-1]
-                            except Exception:
-                                s = 2
-                            try:
-                                time.sleep(float(s))
-                            except Exception as _e:
-                                _log_exc(mod="SYS", stage="EXC_PASS", e=_e)
-
-                        close_platforms = {
-                            'EXT': _exec_global_close_report(ext_exe, 'EXT', ext_done, coins=coins_list, error=close_errors['EXT']),
-                            'VAR': _exec_global_close_report(var_exe, 'VAR', var_done, coins=coins_list, error=close_errors['VAR']),
-                        }
-                        ext_done = close_platforms['EXT']['ok']
-                        var_done = close_platforms['VAR']['ok']
                         fail_reason = '; '.join(p + ':' + d['reason'] for p, d in close_platforms.items() if not d['ok'])
                         for _ci in coins_list:
                             coin1 = str(_ci or "").upper().strip()
@@ -97311,6 +97369,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                         except Exception as _e:
                                             _log_exc(mod="SYS", stage="EXC_PASS", e=_e)
 
+                                        _WORKER_STATE.assert_live()
                                         new_anchor2 = _anchor_update(_tgt_f, reason=_r)
                                         try:
                                             do_bump = True
@@ -97436,7 +97495,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                         except Exception as _e:
                             _log_exc(mod="SYS", stage="EXC_PASS", e=_e)
 
-                        results.append({"req": req.to_dict(), "ok": bool(ok_all), "submit_ok": bool(ok_all), "postcheck_ok": bool(ok_all), "final_ok": bool(ok_all), "trade_effective": bool(ok_all), "reason": ("postcheck_ok" if ok_all else "anchor_force_close_all_partial_fail"), "details": per_coin, "close_platforms": close_platforms, "t_sec": 0.0})
+                        results.append({"req": req.to_dict(), "ok": bool(ok_all), "submit_ok": bool(ok_all), "postcheck_ok": bool(ok_all), "final_ok": bool(ok_all), "trade_effective": bool(ok_all), "reason": ("postcheck_ok" if ok_all else "anchor_force_close_all_partial_fail"), "details": per_coin, "close_platforms": close_platforms, **_close_flow.submission_summary(close_platforms), "t_sec": 0.0})
                         continue
                     elif act == "koujing_a_3step":
 
@@ -103083,8 +103142,11 @@ def main_quanbu():
                                 except Exception:
                                     _ext_found, _var_found = 1, 1
 
-                            _pretrade_found_low_confirmed = False
-                            if int(_ext_found) <= 0 or int(_var_found) <= 0:
+                            _pretrade_found_low_confirmed, _full_close_pretrade_detail = _close_flow.pretrade_evidence(
+                                req0, _snap_pretrade, now=time.time())
+                            if _pretrade_found_low_confirmed:
+                                safe_log(lambda: f"[{now_ts()}] [FULL_CLOSE_PRETRADE_EVIDENCE] detail={_full_close_pretrade_detail}")
+                            if (int(_ext_found) <= 0 or int(_var_found) <= 0) and not _pretrade_found_low_confirmed:
                                 try:
                                     safe_log(lambda: f"[{now_ts()}] PRETRADE_FOUND_LOW_DETECTED（下单前读空初判） ext_found={_ext_found} var_found={_var_found} dq_reason={_dq_reason}")
                                 except Exception as _e:

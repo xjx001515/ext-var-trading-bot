@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 from ast_support import ROOT, load_definitions, parsed
 from bot_core.browser_runtime import SessionLiveness, ExtRecovery, supported_kwargs, safe_url
+from bot_core import close_flow
 import test_ext_recovery as ext_tests
 
 
@@ -340,14 +341,16 @@ class AnchorRecoveryTests(unittest.TestCase):
                    _exec_positions_confirmed_empty=lambda page,cfg:bool(page.flat),
                    _exec_read_portfolio_snapshot=lambda *a,**k:{'available':False},
                    _safety_submission_records=lambda:{})
-        load_definitions({'_exec_global_close_report'}, env)
+        env.update(_close_flow=close_flow,_WORKER_STATE=types.SimpleNamespace(assert_live=noop),
+                   _active_req_bind=noop,_full_close_recover_page=Mock(return_value=False))
+        load_definitions({'_exec_global_close_report','_run_full_close_transaction'}, env)
         load_definitions({'_anchor_should_trigger','_anchor_next_trigger_u','RequestQueue'}, env)
         env['q'] = env['RequestQueue']('unused')
         trigger = next(n for n in ast.walk(tree) if isinstance(n,ast.If) and isinstance(n.test,ast.Call)
                        and isinstance(n.test.func,ast.Name) and n.test.func.id=='_anchor_should_trigger')
         trigger_code = compile(ast.fix_missing_locations(ast.Module(body=[trigger],type_ignores=[])), '<actual anchor trigger>', 'exec')
         source = (ROOT/'BOT5-2-414 .py').read_text(encoding='utf-8-sig')
-        start = source.index('                        retry_max = int(globals().get("ANCHOR_RETRY_MAX"')
+        start = source.index('                        close_platforms = _run_full_close_transaction(')
         end = source.index('                    elif act == "koujing_a_3step":', start)
         import textwrap
         block = ast.parse(textwrap.dedent(source[start:end]))

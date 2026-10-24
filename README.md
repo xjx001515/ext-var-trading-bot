@@ -14,7 +14,7 @@ A Python trading bot for Extended (EXT) and Variational (VAR), built with Playwr
 
 The log viewer updates incrementally and preserves your reading position and text selection while new entries arrive. Background data collection keeps scrolling responsive; use “回到最新” (Latest) to resume following the log.
 
-This repository contains the current maintenance version. Shared logic is being extracted into `bot_core/` while preserving the existing strategy, order sizing, and direction rules. Reconciliation of legacy pending orders is still planned; the maintenance status and test limitations are documented below.
+This repository contains the current maintenance version. Shared logic is being extracted into `bot_core/` while preserving the existing strategy, order sizing, and direction rules. ANCHOR/S1 full closes use a bounded worker, explicit submission evidence, and confirmation that both platforms are flat. Only a proven unsubmitted action can be retried after one page recovery. A legacy pending-order replay tool is available for review; live reconciliation is not enabled.
 
 ## 主要功能
 
@@ -67,7 +67,11 @@ py -3.14 -m venv .venv
 - 已完成待确认拦截第一阶段：按操作类型隔离，开仓和平仓记录分开保存，同币同方向重复平仓继续受保护。
 - 已优化面板日志：移除定时全量重画和三分钟自动跳回，新增分批插入、滚动事件合并、隐藏插页按需刷新。
 - 锚点全平结果分支要求 EXT、VAR 均成功且确认空仓，才提交锚点更新；失败记录平台和残留或无法确认的币种。
-- 旧待确认记录批量对账、启动对账与手动结算命令属于第二阶段，尚未实现。
+- VAR 全平按实际持仓行执行，有限等待确认按钮就绪；只在明确未提交时恢复页面并重试一次。已点击或结果未知时保留待确认，不重复下单。
+- ANCHOR/S1 全平共享 120 秒工作时限和 5 秒外层清理余量；会话报错保留真实原因，读表异常不再伪装成零持仓。
+- 全平预检查使用新鲜结构化持仓证据，避免 `dq_reason=positions_verified` 缺少文本计数时被误挡。执行器仍需重新读取两平台并确认全空。
+- 第二阶段已提供纯函数对账和只读回放命令；旧记录按同方向、当前仓位不少于意图金额 50% 判断。真实 M9/M10 数量增量确认规则保持不变。启动自动对账和实盘手动结算尚未启用，待逐条回放审阅后接入。
+- 维护重启可通过进程环境 `BOT_CONTROLLED_RESTART_RESUME=1` 保留有效的持久化锚点，避免启动重置模块记录；普通启动行为保持原样。该选项不添加交易锁，不代表自动部署授权。
 - 保证金界面字段读取仍可能出现无法识别的情况。当前约定是读取失败时沿用原流程，按钮禁用时停止提交。
 
 源码更新与正在运行的进程是两个状态，补丁需由操作者选择合适时机重启加载。提交仓库不会自动启动交易，也没有配置自动部署。
@@ -77,7 +81,8 @@ py -3.14 -m venv .venv
 本次维护在原本机环境执行的结果：
 
 - 主程序及相关模块 `ast.parse` 语法检查通过。
-- Python 全量 451 项：450 项通过，1 项既有历史快照用例失败。
+- Python 全量 503 项：502 项通过，1 项既有历史快照用例失败；测试禁止网络、子进程、真实浏览器和实盘状态写入。
+- 新增 VAR 全平与预检查回放 33 项、旧记录对账回放 19 项全部通过；另保留真实锚点分支的“失败不抬锚点、后续轮次可再触发”回归测试。
 - 新增的待确认隔离测试 25 项全部通过。
 - 新增的面板日志与后台刷新测试 26 项全部通过，使用独立隐藏 Tk 控件和模拟采集器。
 - 合成 DOM 界面解析测试 7 项全部通过。
@@ -94,6 +99,14 @@ node tests/test_margin_dom.cjs
 ```
 
 Node.js 仅用于上述合成 DOM 测试。维护脚本中的停止、重启准备与补丁应用工具需要人工明确选择执行，不作为安装或测试的自动步骤。
+
+旧待确认记录回放示例（只读输入，在临时目录输出逐条报告与建议副本，不改机器人状态）：
+
+```powershell
+.\.venv\Scripts\python.exe maintenance\replay_unconfirmed.py --journal "<复制的 execution_unconfirmed.json>" --positions "<同一时段的 positions.json>"
+```
+
+默认以输入持仓快照的时间回放历史判断，不代表当前实时持仓。缺失币种不视为空仓，旧记录没有基准数量时也不会生成虚构成交、利润或网格层。
 
 ## 本机数据边界
 
