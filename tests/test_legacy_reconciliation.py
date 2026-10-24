@@ -141,7 +141,7 @@ class ReplayFilesTests(unittest.TestCase):
             j.write_text(json.dumps({'version':2,'records':{'VAR|TEST':record()}}),encoding='utf-8')
             s.write_text(json.dumps(snapshot()),encoding='utf-8');before=(j.read_bytes(),s.read_bytes())
             result,folder=run(j,s,base/'replay')
-            self.assertEqual(result['changed_records'],1);self.assertFalse(result['runtime_auto_reconciliation_enabled'])
+            self.assertEqual(result['changed_records'],1);self.assertFalse(result['writes_live_journal'])
             self.assertEqual((j.read_bytes(),s.read_bytes()),before)
             self.assertTrue((folder/'replay.txt').exists())
             with self.assertRaises(FileExistsError):run(j,s,folder)

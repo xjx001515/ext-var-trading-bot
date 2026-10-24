@@ -61,6 +61,7 @@ FUNCTIONS = {
     '_postcheck_reconcile_unconfirmed_scan', '_safety_submission_records',
     '_safety_submission_save', '_safety_pending_scope', '_safety_reserve_submission',
     '_safety_resolve_submission', '_exec_clear_pending', '_postcheck_validate_effect_v2',
+    '_submission_blocker_detail','_req_ensure_meta',
 }
 
 
@@ -93,6 +94,7 @@ def install_actual_verification_loop(env, clock):
     block = textwrap.dedent(source[begin:end])
     driver = ('def drive(pending, snap):\n'
               '    passes = 0\n'
+              '    exec_skip_attempts = 0\n'
               '    while pending:\n'
               '        passes += 1\n'
               '        if passes > 100: raise AssertionError("round failed to finish")\n'
@@ -113,6 +115,7 @@ def install_actual_verification_loop(env, clock):
                _postcheck_extract_coin_state=scoped, _ORIG_TIME_SLEEP=clock.sleep,
                POSTCHECK_VERIFY_RETRY_DELAY_SEC=6.0, POSTCHECK_VERIFY_FINAL_DELAY_SEC=8.0,
                _round_req_terminal=Mock(), _state_commit_confirmed_success=Mock(return_value={}),
+               _observe_execution_result=Mock(),
                _state_commit_postcheck_fail=Mock(return_value={}), _log_exc=Mock(), _append_txt=Mock())
     exec(compile(driver, '<actual verification loop only>', 'exec'), env)
 
@@ -254,6 +257,11 @@ class ActualLoopTests(unittest.TestCase):
         req = request()
         pre = {'ext_position_state': 'CONFIRMED_EMPTY', 'ext_side': 'NONE', 'ext_qty': 0,
                'ext_notional_u': 0, 'ext_reason': 'empty_positions_view'}
+        # This verification loop follows an actual dispatched order; the UI
+        # boundary persisted its claim before click, as in production.
+        env['_safety_reserve_submission']('EXT','TIA','SHORT','open',
+            {'position_state':'CONFIRMED_EMPTY'},260,reason='submit_click_dispatched',
+            submission_attempt_id='original-attempt',module='B1')
         env['_postcheck_pending_verify_mark'](req, pre_state=pre, verify_retry_left=retries)
         clock.sleep(age)
         if fault:

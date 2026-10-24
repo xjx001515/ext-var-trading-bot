@@ -14,7 +14,7 @@ A Python trading bot for Extended (EXT) and Variational (VAR), built with Playwr
 
 The log viewer updates incrementally and preserves your reading position and text selection while new entries arrive. Background data collection keeps scrolling responsive; use “回到最新” (Latest) to resume following the log.
 
-This repository contains the current maintenance version. Shared logic is being extracted into `bot_core/` while preserving the existing strategy, order sizing, and direction rules. ANCHOR/S1 full closes use a bounded worker, explicit submission evidence, and confirmation that both platforms are flat. Only a proven unsubmitted action can be retried after one page recovery. A legacy pending-order replay tool is available for review; live reconciliation is not enabled.
+This repository contains the current maintenance version. Shared logic is being extracted into `bot_core/` while preserving the existing strategy, order sizing, and direction rules. ANCHOR/S1 full closes use a bounded worker, explicit submission evidence, and confirmation that both platforms are flat. Only a proven unsubmitted action can be retried after one page recovery. Legacy pending records are reconciled at startup and after fresh full scans. Manual settlements use an audited command inbox with fingerprint checks; only the running bot writes the journal. These settlements do not create trades, profits, or grid layers.
 
 ## 主要功能
 
@@ -71,7 +71,10 @@ py -3.14 -m venv .venv
 - 逐币平仓后用两次一致的完整持仓表确认目标币消失，即使其他币仍有仓位也能结算该笔平仓；先前已提交的单币平仓同样只核验、不重发。平台 ALL 待确认仍禁止重复提交。
 - ANCHOR/S1 全平共享 120 秒工作时限和 5 秒外层清理余量；会话报错保留真实原因，读表异常不再伪装成零持仓。
 - 全平预检查使用新鲜结构化持仓证据，避免 `dq_reason=positions_verified` 缺少文本计数时被误挡。执行器仍需重新读取两平台并确认全空。
-- 第二阶段已提供纯函数对账和只读回放命令；旧记录按同方向、当前仓位不少于意图金额 50% 判断。真实 M9/M10 数量增量确认规则保持不变。启动自动对账和实盘手动结算尚未启用，待逐条回放审阅后接入。
+- 第二阶段已接入启动首轮及后续完整扫描对账。缺少下单前数量的旧首仓记录按同方向、当前仓位不少于原金额 50% 判断；有可靠基准的记录继续使用数量增量。真实 M9/M10 专用确认规则保持不变。
+- M2 附带完整持仓表覆盖证据，用于核对已离开当前币池的旧记录，不改变币池或策略。三次独立新鲜空仓证据才能推定未成交；有历史持仓/平仓证据的记录区分为已平。
+- 已确认两平台空仓的全平结果不会再被通用 `ALL` 币种查询降级。被旧记录拦截的新请求不会创建假待确认，记录冲突不会再误升为全局账本故障。
+- 执行日志区分“本次未提交”“旧单待确认”和“账本不可用”，列出拦截范围、原单金额、时间和最近对账依据；轮次摘要单独统计未提交/跳过。
 - 维护重启可通过进程环境 `BOT_CONTROLLED_RESTART_RESUME=1` 保留有效的持久化锚点，避免启动重置模块记录；普通启动行为保持原样。该选项不添加交易锁，不代表自动部署授权。
 - 保证金界面字段读取仍可能出现无法识别的情况。当前约定是读取失败时沿用原流程，按钮禁用时停止提交。
 
@@ -82,7 +85,8 @@ py -3.14 -m venv .venv
 本次维护在原本机环境执行的结果：
 
 - 主程序及相关模块 `ast.parse` 语法检查通过。
-- Python 全量 507 项：506 项通过，1 项既有历史快照用例失败；测试禁止网络、子进程、真实浏览器和实盘状态写入。
+- Python 全量 535 项：534 项通过，1 项既有历史快照用例失败；测试禁止网络、子进程、真实浏览器和实盘状态写入。
+- 第二阶段新增 28 项全部通过，覆盖启动及跨轮对账、完整表覆盖、ALL 范围保护、假待确认防护、日志解释、手动命令指纹冲突、写入失败与重启幂等。
 - 新增 VAR 全平与预检查回放 37 项、旧记录对账回放 19 项全部通过；另保留真实锚点分支的“失败不抬锚点、后续轮次可再触发”回归测试。
 - 新增的待确认隔离测试 25 项全部通过。
 - 新增的面板日志与后台刷新测试 26 项全部通过，使用独立隐藏 Tk 控件和模拟采集器。
@@ -108,6 +112,23 @@ Node.js 仅用于上述合成 DOM 测试。维护脚本中的停止、重启准�
 ```
 
 默认以输入持仓快照的时间回放历史判断，不代表当前实时持仓。缺失币种不视为空仓，旧记录没有基准数量时也不会生成虚构成交、利润或网格层。
+
+手动结算命令先查看记录，再预览指定状态：
+
+```powershell
+.\.venv\Scripts\python.exe maintenance\settle_unconfirmed.py list
+.\.venv\Scripts\python.exe maintenance\settle_unconfirmed.py settle --key "EXT|COIN" --state RESOLVED_FLAT --reason "人工核对该旧记录已结束" --expected "list 输出的完整 fingerprint"
+```
+
+核对预览后，在同一条 `settle` 命令末尾加 `--apply` 入队。用返回的命令 ID 查询：
+
+```powershell
+.\.venv\Scripts\python.exe maintenance\settle_unconfirmed.py status "命令ID"
+```
+
+默认只预览；入队后由机器人下次完整、新鲜扫描处理，`APPLIED` 才表示已结算。记录变化会拒绝覆盖，需重新查看核对。命令不下单、不平仓，也不生成利润或网格层；结算后原策略按正常条件重新判断。M9/M10 专用确认记录拒绝直接手动解除。
+
+审计保存在本机 `out/state/execution_settlement_audit.jsonl`，包括操作前记录、原因、指纹及提交结果；命令与回执保存在 `out/state/manual_settlements/`。外部命令不直接修改运行中的 `execution_unconfirmed.json`，避免被缓存覆盖。
 
 ## 本机数据边界
 

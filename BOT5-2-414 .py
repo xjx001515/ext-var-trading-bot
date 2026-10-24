@@ -12596,8 +12596,9 @@ def _safety_submission_records():
                     if not isinstance(data, dict) or not isinstance(data.get('records'), dict):
                         raise ValueError('invalid unconfirmed-order journal')
                     records = scope.index_records(data['records'])
-            except Exception:
+            except Exception as exc:
                 globals()['_SAFETY_SUBMISSION_FAULT'] = True
+                globals()['_SAFETY_SUBMISSION_FAULT_DETAIL'] = f'journal_read:{type(exc).__name__}:{exc}'
             globals()['_SAFETY_SUBMISSION_RECORDS'] = records
         return globals()['_SAFETY_SUBMISSION_RECORDS']
 
@@ -12616,15 +12617,21 @@ def _safety_submission_save():
             if json.load(fp) != payload:
                 raise OSError('unconfirmed-order journal readback mismatch')
         return True
-    except Exception:
+    except Exception as exc:
         globals()['_SAFETY_SUBMISSION_FAULT'] = True
+        globals()['_SAFETY_SUBMISSION_FAULT_DETAIL'] = f'journal_save:{type(exc).__name__}:{exc}'
+        try:
+            safe_log(lambda: f"[{now_ts()}] [SUBMISSION_JOURNAL_ERROR] reason={globals()['_SAFETY_SUBMISSION_FAULT_DETAIL']}")
+        except Exception:
+            pass  # Logging failure must not change the fail-closed save result.
         return False
 
 def _safety_pending_scope(plat, coin, kind='open', side=''):
     from bot_core import submission_scope as scope
     records = _safety_submission_records()
     if globals().get('_SAFETY_SUBMISSION_FAULT'):
-        return {'state': 'UNAVAILABLE', 'reason': 'submission_journal_unavailable'}
+        return {'state': 'UNAVAILABLE', 'reason': 'submission_journal_unavailable',
+                'fault_detail': globals().get('_SAFETY_SUBMISSION_FAULT_DETAIL', 'journal_integrity_unverified')}
     p, c = str(plat or '').upper(), str(coin or '').upper()
     for record in list(records.values()):
         if scope.blocks(record, p, c, kind, side):
@@ -12661,6 +12668,16 @@ def _safety_reserve_submission(plat, coin, side, kind, pre_position, usd, reason
             'tolerance_usd': float(globals().get('M9_EXT_POSTCHECK_DELTA_TOL_U', 10.0) or 10.0)}
         if not _safety_submission_save():
             raise RuntimeError('submission_journal_not_durable_no_submit')
+
+
+def _submission_blocker_detail(record, req=None):
+    from bot_core.submission_diagnostics import describe
+    detail = describe(record, now=float(time.time()))
+    if req is not None:
+        _req_ensure_meta(req)['submission_blocker'] = detail
+    safe_log(lambda: f"[{now_ts()}] [SUBMISSION_BLOCKED] code={detail['code']} "
+             f"scope={detail['scope']} submit_attempted=0 explanation={detail['message']}")
+    return detail
 
 def _safety_resolve_submission(plat, coin, row, *, kind=None):
     from bot_core import submission_scope as scope
@@ -30616,9 +30633,11 @@ def _exe_open_position_safe(exe: Any, order: Any, *, dry_run: bool = False, plat
     coin = str(getattr(order, 'coin', '') or (order.get('coin') if isinstance(order, dict) else '') or '').upper()
     platform = str(plat or getattr(order, 'platform', '') or '').upper()
     pending_kind, held_side = scope.order_scope(order)
-    if not dry_run and _safety_pending_scope(platform, coin, pending_kind, held_side):
-        _submit_attempt_set(order, 'BLOCKED', 'blocked_existing_unconfirmed_no_submit')
-        _set_last_exec_err(reason='blocked_existing_unconfirmed_no_submit', coin=coin, plat=platform, act=act)
+    blocker = _safety_pending_scope(platform, coin, pending_kind, held_side) if not dry_run else {}
+    if blocker:
+        detail = _submission_blocker_detail(blocker, getattr(order, '_exec_req_ref', None))
+        _submit_attempt_set(order, 'BLOCKED', detail['code'], blocker=detail, explanation=detail['message'])
+        _set_last_exec_err(reason=detail['code'], err=detail['message'], coin=coin, plat=platform, act=act)
         return False
     if not _pw_guard(mod='EXEC', coin=coin, plat=platform, act=act or 'open_position', stage='OPEN_POSITION'):
         return False
@@ -30657,6 +30676,14 @@ def _exe_open_position_safe(exe: Any, order: Any, *, dry_run: bool = False, plat
     if _safety_pending_scope(platform, coin, pending_kind, held_side):
         _set_last_exec_err(reason='submitted_pending_confirm', coin=coin, plat=platform, act=act)
         return False
+    verified = getattr(order, 'meta', {}) or {}
+    evidence = verified.get('_submit_verified_ev') or {}
+    row_evidence = evidence.get('row_evidence') or {}
+    if (result and verified.get('_submit_verified_ok') is True and row_evidence.get('effective') is True
+            and row_evidence.get('confirm_basis') == 'position_quantity_delta'
+            and getattr(order, '_exec_req_ref', None) is not None):
+        _req_ensure_meta(order._exec_req_ref).update(_submit_verified_ok=True,
+            _submit_verified_ev=copy.deepcopy(evidence), _submit_verified_source='position_delta')
     return result
 
 def _exe_try_place_order(exe: Any, order: Any, *, dry_run: bool = False, plat: str = "", act: str = "") -> bool:
@@ -31756,6 +31783,7 @@ def _m2_scan_impl(cdp: str, coins: List[str], logfp: str, seed: Optional[int] = 
                     platform_empty_map = {"EXT": False, "VAR": False}
                     platform_empty_reason_map = {"EXT": "", "VAR": ""}
                     platform_empty_detail_map = {"EXT": {}, "VAR": {}}
+                    platform_position_coverage = {"EXT": {}, "VAR": {}}
                     _positions_total_budget = max(10.0, min(float(_m2_scan_timeout_sec(90.0) or 90.0) * 0.6, 120.0))
                     _positions_started_ts = float(time.time())
                     _plat_budget = min(_m2_positions_platform_timeout_sec(), max(5.0, _positions_total_budget / 2.0))
@@ -31872,6 +31900,8 @@ def _m2_scan_impl(cdp: str, coins: List[str], logfp: str, seed: Optional[int] = 
                                     _record_swallowed_exception('except_pass_line_498a', _e)
                                     pass
                         _bulk_complete = bool(_bulk_complete and _table_coverage_verified(page, cfg, len(_bulk_rows)))
+                        platform_position_coverage[plat] = {'complete': bool(_bulk_complete),
+                            'coins': sorted(_bulk_rows), 'ts': float(time.time()), 'source': 'verified_positions_table'}
                         _req_coin_set = {str(x or '').upper().strip() for x in list(_req_coins or []) if str(x or '').strip()}
                         _plat_live_coin_set = {str(x or '').upper().strip() for x in (list(_ext_live_coins or []) if plat == 'EXT' else list(_var_live_coins or [])) if str(x or '').strip()}
                         for coin in coins:
@@ -32727,6 +32757,7 @@ def _m2_scan_impl(cdp: str, coins: List[str], logfp: str, seed: Optional[int] = 
             snapshot['raw']['platform_empty_map'] = dict(platform_empty_map or {})
             snapshot['raw']['platform_empty_reason_map'] = dict(platform_empty_reason_map or {})
             snapshot['raw']['platform_empty_detail_map'] = dict(platform_empty_detail_map or {})
+            snapshot['raw']['platform_position_coverage'] = dict(platform_position_coverage or {})
         except Exception as _e:
             _log_exc(mod="SYS", stage="EXC_PASS", e=_e)
 
@@ -38382,7 +38413,7 @@ def _exec_result_summary_counts(res_list: list | None) -> dict:
                 if bool(rr.get('skipped')):
                     out['skip_cnt'] += 1
                     if not out['first_skip_reason']:
-                        out['first_skip_reason'] = str(rr.get('reason') or rr.get('err') or '')
+                        out['first_skip_reason'] = str(rr.get('message') or rr.get('reason') or rr.get('err') or '')
                     continue
                 state = str(rr.get('confirmation_state') or _result_confirmation_state(rr) or 'unknown')
                 if state == 'confirmed_success':
@@ -38526,6 +38557,10 @@ def _observe_execution_result(req: object | None, ok_cnt: int = 0, fail_cnt: int
                 return
         act_cn = {'open':'开仓','close':'平仓','reduce':'减仓','decrease':'减仓','tp':'止盈','take_profit':'止盈','add':'加仓','increase':'加仓'}.get(act, act or '动作')
         base = f'[{coin or "-"}][{plat or "-"}][{mod or "-"}] {act_cn}'
+        _blocker = _meta.get('submission_blocker') or {}
+        if int(skip_cnt or 0) > 0 and _blocker:
+            _observe_emit('执行', f"{base} 未提交：{_blocker.get('message') or err} | 本次新增待确认=0 跳过={int(skip_cnt)}")
+            return
         if int(ok_cnt or 0) > 0:
             _observe_emit('执行', f'{base} 确认成功：确认成功={int(ok_cnt)} 待确认={int(pending_cnt)} 失败={int(fail_cnt)} 跳过={int(skip_cnt)}')
         elif int(pending_cnt or 0) > 0 and int(fail_cnt or 0) <= 0:
@@ -38537,13 +38572,13 @@ def _observe_execution_result(req: object | None, ok_cnt: int = 0, fail_cnt: int
     except Exception as _e:
         _record_swallowed_exception('except_pass_line_668', _e)
         pass
-def _observe_round_finish(scan_count: int, *, start_ts: float | None = None, end_ts: float | None = None, next_scan_text: str = '', interval_sec: int | float = 0, steps: int = 0, attempts: int = 0, ok_attempts: int = 0, fail_attempts: int = 0, pending_attempts: int = 0) -> None:
+def _observe_round_finish(scan_count: int, *, start_ts: float | None = None, end_ts: float | None = None, next_scan_text: str = '', interval_sec: int | float = 0, steps: int = 0, attempts: int = 0, ok_attempts: int = 0, fail_attempts: int = 0, pending_attempts: int = 0, skipped_attempts: int = 0) -> None:
     try:
         st = float(start_ts or 0.0)
         et = float(end_ts or time.time())
         cost = max(0.0, et - st) if st > 0 else 0.0
         _observe_emit('轮次结束', f'第{int(scan_count or 0)}轮结束 | 结束时间={_observe_ts_text(et, full=True)} | 本轮总耗时={cost:.1f}秒')
-        _observe_emit('轮次结束', f'本轮执行汇总：请求={int(steps or 0)} | 尝试={int(attempts or 0)} | 确认成功={int(ok_attempts or 0)} | 待确认={int(pending_attempts or 0)} | 失败={int(fail_attempts or 0)}')
+        _observe_emit('轮次结束', f'本轮执行汇总：请求={int(steps or 0)} | 执行检查={int(attempts or 0)} | 确认成功={int(ok_attempts or 0)} | 本次待确认={int(pending_attempts or 0)} | 失败={int(fail_attempts or 0)} | 未提交/跳过={int(skipped_attempts or 0)}')
         _observe_emit('轮次结束', f'下轮预计开始：{str(next_scan_text or "-")} | 预计间隔={float(interval_sec or 0.0)/60.0:.1f}分钟')
         try:
             _observe_emit('动态币池', _coin_pool_compact_text())
@@ -59174,7 +59209,7 @@ def _postcheck_verify_budget(req_any, *, now_ts_v=None):
 
 
 def _postcheck_defer_to_scan(req_any, *, reason='', payload=None):
-    """Detach round work while preserving the original durable submission claim."""
+    """Detach verification without inventing a new order or poisoning other scopes."""
     from bot_core import submission_scope as scope
     pv = dict(payload if isinstance(payload, dict) else _postcheck_pending_verify_payload(req_any))
     req = _req_get_dict(req_any)
@@ -59183,79 +59218,99 @@ def _postcheck_defer_to_scan(req_any, *, reason='', payload=None):
     action = _postcheck_req_action_lower(req_any)
     params, meta = req.get('params') or {}, req.get('meta') or {}
     side = _a1_norm_side(req.get('side') or params.get('side') or meta.get('side'))
-    durable = False
+    keys, durable = [], False
     try:
         with _SYNC_PW_WORKER_LOCK:
             records = _safety_submission_records()
+            if globals().get('_SAFETY_SUBMISSION_FAULT'):
+                raise RuntimeError('submission_journal_unavailable')
+            kind = 'open' if scope.family(action) == 'open' else ('close_all' if 'close' in action else 'close')
             platforms = [platform] if platform in ('EXT', 'VAR') else ['EXT', 'VAR']
-            keys = []
             for plat in platforms:
-                kind = 'open' if scope.family(action) == 'open' else ('close_all' if 'close' in action else 'close')
                 pre_leg = _safety_scoped_position(pv.get('pre_state') or {}, plat)
-                held_side = side if kind == 'open' else scope.side(pre_leg.get('side')) or side
-                key = scope.key(plat, coin, kind, held_side)
-                record = records.get(key) or {}
-                if not record:
-                    _safety_reserve_submission(plat, coin, held_side, kind, pre_leg,
-                        _postcheck_req_amount_u(req_any), reason='postcheck_deferred_unconfirmed', allow_existing=True)
-                    record = records.get(key) or {}
-                if not _safety_pending_blocks(record):
-                    continue
-                # Do not replace the old amount, timestamp, side or quantity baseline
-                # with a later request that was blocked by this existing order.
-                record.setdefault('deferred_postcheck', {
-                    'module': str(req.get('module') or '').upper(),
-                    'observing_request_id': str(meta.get('req_id') or req.get('request_id') or ''),
-                    'started_ts': pv.get('created_ts'), 'deferred_ts': float(time.time()),
-                    'reason': str(reason or 'postcheck_budget_exhausted'),
-                })
-                records[key] = record
-                keys.append(key)
-            durable = bool(_safety_submission_save())
-            if not durable:
-                globals()['_SAFETY_SUBMISSION_FAULT'] = True
-        _req_exec_once_mark(req_any, 'PENDING_CONFIRM', 'postcheck_deferred_to_scan')
+                held = side if kind == 'open' else scope.side(pre_leg.get('side')) or side
+                candidates = [(k,r) for k,r in records.items() if r.get('platform') == plat
+                    and (coin == 'ALL' or r.get('coin') == coin)
+                    and scope.family(r.get('kind')) == scope.family(kind) and _safety_pending_blocks(r)]
+                # The button layer normally reserved the record before dispatch.
+                # A parent's ALL lookup or a blocked new request is not a new order.
+                if not candidates and coin != 'ALL' and reason != 'blocked_existing_unconfirmed_no_submit':
+                    sent = [a for a in meta.get('_submission_attempts', [])
+                        if a.get('platform') == plat and a.get('coin') == coin
+                        and a.get('state') in ('CLICK_STARTED','CLICKED','CLICK_UNKNOWN')]
+                    key = scope.key(plat, coin, kind, held)
+                    if sent and key not in records and not _safety_pending_scope(plat, coin, kind, held):
+                        _safety_reserve_submission(plat, coin, held, kind, pre_leg,
+                            _postcheck_req_amount_u(req_any), reason='postcheck_deferred_dispatched',
+                            submission_attempt_id=sent[-1].get('id',''), module=str(req.get('module') or ''))
+                        candidates = [(key,records[key])]
+                for key,record in candidates:
+                    record.setdefault('deferred_postcheck', {'module':str(req.get('module') or '').upper(),
+                        'observing_request_id':str(meta.get('req_id') or req.get('req_id') or ''),
+                        'started_ts':pv.get('created_ts'),'deferred_ts':float(time.time()),'reason':str(reason)})
+                    keys.append(key)
+            durable = bool(_safety_submission_save()) if keys else True
+        state = 'PENDING_CONFIRM' if keys else 'SKIPPED'
+        _req_exec_once_mark(req_any, state, 'postcheck_deferred_to_scan' if keys else 'no_unresolved_submission_claim')
         safe_log(lambda: f"[{now_ts()}] POSTCHECK_DEFER_UNCONFIRMED coin={coin} mod={req.get('module','')} reason={reason} durable={int(durable)} scopes={keys} inround_retry=0")
     except Exception as exc:
-        globals()['_SAFETY_SUBMISSION_FAULT'] = True
-        try:
-            safe_log(lambda: f"[{now_ts()}] POSTCHECK_DEFER_PERSIST_FAILED coin={coin} reason={type(exc).__name__} duplicate_submit_blocked=1")
-        except Exception:
-            pass
+        # Reservation conflicts/request errors are not journal corruption.
+        safe_log(lambda: f"[{now_ts()}] POSTCHECK_DEFER_FAILED coin={coin} reason={type(exc).__name__}:{exc} journal_fault={int(bool(globals().get('_SAFETY_SUBMISSION_FAULT')))}")
     finally:
-        # A journal error must not send this verification request into execution.
         _postcheck_pending_verify_clear(req_any)
     return durable
 
 
 def _postcheck_reconcile_unconfirmed_scan(snapshot, *, scan_id):
-    """Called once per main-loop scan, never by the within-round verification loop."""
-    resolved = []
-    cleanup = []
+    """Startup and each independent full scan: one journal writer, audited settlements."""
+    from bot_core import legacy_reconciliation as reconcile
+    from bot_core.settlement_commands import SettlementInbox, commit_reconciliation
+    now = float(time.time())
+    fresh = reconcile.snapshot_is_fresh(snapshot, now=now)
+    startup = not globals().get('_SAFETY_RECON_STARTUP_DONE', False)
+    stage = ('STARTUP' if fresh else 'STARTUP_WAIT') if startup else 'SCAN'
+    inbox = SettlementInbox(OUT_DIR)
     with _SYNC_PW_WORKER_LOCK:
         records = _safety_submission_records()
-        before = copy.deepcopy(records)
-        for key, record in list(records.items()):
-            updated, outcome = _postcheck_lifecycle.observe_pending(
-                record, snapshot, scan_id=scan_id, now=float(time.time()))
-            if updated != record:
-                records[key] = updated
-            if outcome in ('confirmed', 'not_filled'):
-                resolved.append((key, updated, outcome))
-            if outcome in ('confirmed', 'not_filled', 'terminal'):
-                cleanup.append(updated)
-        if records != before and not _safety_submission_save():
-            records.clear()
-            records.update(before)
+        if globals().get('_SAFETY_SUBMISSION_FAULT'):
+            safe_log(lambda: f"[{now_ts()}] [RECONCILE_BLOCKED] stage={stage} reason={globals().get('_SAFETY_SUBMISSION_FAULT_DETAIL','journal_unavailable')}")
             return []
+        commands = inbox.consume(records, _safety_submission_save, now=now) if fresh else []
+        updated, decisions = reconcile.replay(records, snapshot, now=now, scan_id=scan_id)
+        for detail in decisions:
+            key = detail['record_key']
+            detail['reason_text'] = reconcile.decision_text(detail)
+            if (detail['original_state'] not in reconcile.TERMINAL
+                    and detail['reason'] != 'separate_m9_m10_confirmation_policy'):
+                updated[key]['reconciliation_last'] = {k:detail.get(k) for k in
+                    ('reason','reason_text','snapshot_ts','current_side','current_notional_u','empty_scan_count')}
+                updated[key]['reconciliation_last'].update(checked_ts=now,stage=stage)
+        if not commit_reconciliation(records, updated, decisions, save=_safety_submission_save,
+                                     inbox=inbox, now=now, stage=stage):
+            safe_log(lambda: f"[{now_ts()}] [RECONCILE_SAVE_FAILED] stage={stage} memory_rolled_back=1")
+            return []
+        cleanup = [dict(r) for r in records.values() if not _safety_pending_blocks(r)]
+        if fresh:globals()['_SAFETY_RECON_STARTUP_DONE'] = True
     for record in cleanup:
-        for side in ('LONG', 'SHORT'):
-            _exec_clear_pending(record.get('platform'), record.get('coin'), side, kind=record.get('kind'))
-    for key, record, outcome in resolved:
-        label = 'POSTCHECK_SCAN_NOT_FILLED' if outcome == 'not_filled' else 'POSTCHECK_SCAN_CONFIRMED'
-        evidence = record.get('evidence') or {}
-        safe_log(lambda: f"[{now_ts()}] {label} scope={key} side={record.get('side')} state={record.get('state')} reason={record.get('failure_reason') or evidence.get('reason')} fresh_empty_count={evidence.get('count',0)} exchange_rejection_confirmed={int(bool(evidence.get('exchange_rejection_confirmed')))}")
-    return [key for key, _, _ in resolved]
+        for side in ('LONG','SHORT'):
+            _exec_clear_pending(record.get('platform'),record.get('coin'),side,kind=record.get('kind'))
+    for command in commands:
+        safe_log(lambda: f"[{now_ts()}] [MANUAL_SETTLEMENT] id={command['id']} scope={command.get('record_key')} status={command['status']} reason={command['reason']}")
+    resolved = []
+    last = globals().setdefault('_SAFETY_RECON_LAST_LOG', {})
+    for detail in decisions:
+        key = detail['record_key']
+        changed = detail['proposed_state'] != detail['original_state']
+        signature = (detail['proposed_state'],detail['reason'],detail.get('empty_scan_count'))
+        if startup or changed or last.get(key) != signature:
+            safe_log(lambda: f"[{now_ts()}] [UNCONFIRMED_RECONCILE] stage={stage} scope={key} before={detail['original_state']} state={detail['proposed_state']} reason={detail['reason']} detail={detail['reason_text']} snapshot_ts={detail['snapshot_ts']}")
+            last[key] = signature
+        if changed:
+            resolved.append(key)
+            label = 'POSTCHECK_SCAN_NOT_FILLED' if detail['proposed_state']=='CONFIRMED_NOT_FILLED' else 'POSTCHECK_SCAN_CONFIRMED'
+            safe_log(lambda: f"[{now_ts()}] {label} scope={key} state={detail['proposed_state']} reason={detail['reason']}")
+    safe_log(lambda: f"[{now_ts()}] [UNCONFIRMED_RECONCILE_SUMMARY] stage={stage} fresh={int(fresh)} records={len(decisions)} resolved={len(resolved)} manual={len(commands)}")
+    return resolved
 
 def _m10_postcheck_collect_step_meta(req_any: Any, exec_res_list: Any = None) -> dict:
     """收集 M10 三步父子证据，供 postcheck 严格判定。
@@ -59352,7 +59407,11 @@ def _postcheck_reduce_success_reason(*, req_any: Any, pre: Dict[str, Any], post:
     return ('postcheck_reduce_quantity_ok' if ok else None), d
 
 def _postcheck_validate_effect_v2(req_any: Any, pre: Dict[str, Any], post: Dict[str, Any], *, exec_res_list: Any = None) -> tuple[str, str, Dict[str, Any]]:
+    from bot_core.postcheck_lifecycle import confirmed_full_close_result
     req = _req_get_dict(req_any)
+    full_close = confirmed_full_close_result(req, exec_res_list)
+    if full_close:
+        return 'success', full_close['reason'], full_close
     params = req.get('params') if isinstance(req.get('params'), dict) else {}
     meta = req.get('meta') if isinstance(req.get('meta'), dict) else {}
     act = _postcheck_req_action_lower(req_any)
@@ -75245,6 +75304,14 @@ class Adapter:
             "VAR": v_list,
             "positions": (e_list + v_list),
             "raw_positions": raw_pos,
+            "raw": {k: (snapshot.get('raw') or {}).get(k) for k in
+                    ('platform_empty_detail_map', 'platform_position_coverage')},
+            "scan_scope": snapshot.get('scan_scope'),
+            "meta": {k: (snapshot.get('meta') or {}).get(k) for k in
+                     ('scan_scope','scope','cache_hit','postcheck_direct_read')},
+            "stale": bool(snapshot.get('stale')),
+            "dq_fallback": bool(snapshot.get('dq_fallback')),
+            "recovered_from_last_good": bool(snapshot.get('recovered_from_last_good')),
             "indicators": snapshot.get("indicators") or {},
             "indicator_observe": _indicator_observe_payload(list((globals().get("MAIN_COINS") or [])), now_ts_v=ts),
         }
@@ -102562,6 +102629,7 @@ def main_quanbu():
                     exec_ok_attempts = 0  # 仅 confirmation_state=confirmed_success 的结果条数
                     exec_pending_attempts = 0  # 已提交/待确认，未完成 postcheck 硬确认
                     exec_fail_attempts = 0  # confirmed_fail/submit_fail/pending_timeout_fail 的结果条数
+                    exec_skip_attempts = 0  # 展示用，不改变扫描间隔或策略判断
                     max_steps_this_round = int(os.getenv('EXEC_MAX_STEPS_PER_ROUND', '999999') or '999999')
                     max_attempts_this_round = int(os.getenv('EXEC_MAX_ATTEMPTS_PER_ROUND', str(max_steps_this_round*2)) or str(max_steps_this_round*2))
                     steps = 0
@@ -102956,12 +103024,14 @@ def main_quanbu():
                         if str(getattr(req0, 'module', '') or '').upper() == 'B1' and _postcheck_req_action_lower(req0) in ('open', 'open_leg', 'open_more'):
                             _old_pending = _safety_pending_scope(getattr(req0, 'platform', ''), getattr(req0, 'coin', ''))
                             if _old_pending:
-                                _postcheck_defer_to_scan(req0, reason='blocked_existing_unconfirmed_no_submit')
+                                _block_detail = _submission_blocker_detail(_old_pending, req0)
                                 _round_req_terminal(req0, 'SKIPPED', 'blocked_existing_unconfirmed_no_submit')
                                 exec_res.append({'req': _req_get_dict(req0), 'ok': False, 'skipped': True,
                                     'submit_ok': False, 'pending_confirm': False, 'trade_effective': False,
-                                    'reason': 'blocked_existing_unconfirmed_no_submit', 'ts': float(time.time())})
-                                safe_log(lambda: f"[{now_ts()}] EXEC_BLOCK_EXISTING_UNCONFIRMED coin={getattr(req0,'coin','')} mod=B1 submit_attempted=0 original_amount_u={_old_pending.get('intent_usd')} original_ts={_old_pending.get('ts')}")
+                                    'no_submit': True, 'reason': _block_detail['code'], 'message': _block_detail['message'],
+                                    'submission_blocker': _block_detail, 'ts': float(time.time())})
+                                _observe_execution_result(req0, skip_cnt=1, err=_block_detail['message'])
+                                exec_skip_attempts += 1
                                 continue
                         _snap_pretrade = None
                         try:
@@ -103962,6 +104032,7 @@ def main_quanbu():
                                 exec_ok_attempts += _ok_cnt
                                 exec_pending_attempts += _pending_cnt
                                 exec_fail_attempts += _fail_cnt
+                                exec_skip_attempts += _skip_cnt
                             except Exception as _e:
                                 _log_exc(mod="SYS", stage="EXC_PASS", e=_e)
 
@@ -104625,7 +104696,7 @@ def main_quanbu():
             except Exception as _e:
                 _log_exc(mod='SYS', stage='SCAN_INTERVAL_ADJUST', e=_e)
             try:
-                _observe_round_finish(int(scan_count), start_ts=float(scan_start), end_ts=float(time.time()), next_scan_text=str(next_shijian), interval_sec=int(jiange), steps=int(steps or 0), attempts=int(attempts or 0), ok_attempts=int(ok_attempts or 0), pending_attempts=int(pending_attempts or 0), fail_attempts=int(fail_attempts or 0))
+                _observe_round_finish(int(scan_count), start_ts=float(scan_start), end_ts=float(time.time()), next_scan_text=str(next_shijian), interval_sec=int(jiange), steps=int(steps or 0), attempts=int(attempts or 0), ok_attempts=int(ok_attempts or 0), pending_attempts=int(pending_attempts or 0), fail_attempts=int(fail_attempts or 0), skipped_attempts=int(locals().get('exec_skip_attempts',0) or 0))
             except Exception as _e:
                 _record_swallowed_exception('except_pass_line_1750', _e)
                 pass

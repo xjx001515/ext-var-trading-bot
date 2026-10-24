@@ -152,13 +152,18 @@ def apply_submission_evidence(result, attempts=()):
     dispatched = [a for a in rows if a.get('state') in ('CLICK_STARTED', 'CLICKED', 'CLICK_UNKNOWN')]
     no_submit_codes = ('submit_click_fail', 'submit_btn_disabled', 'submit_btn_not_found',
         'submit_btn_not_visible', 'submit_btn_wait_enabled_fail', 'submit_btn_still_disabled',
-        'blocked_existing_unconfirmed_no_submit', 'insufficient_available_margin')
+        'blocked_existing_unconfirmed_no_submit', 'submission_journal_unavailable_no_submit', 'insufficient_available_margin')
     if rows and not dispatched or (not rows and str(r.get('reason') or '') in no_submit_codes):
         reason = str((rows[-1].get('reason') if rows else '') or r.get('reason') or 'no_submit')
         r.update(ok=False, submit_ok=False, submit_attempted=False, no_submit=True,
                  pending=False, pending_confirm=False, confirmed_fail=True, postcheck_ok=False,
                  confirmed_success=False, trade_effective=False, reason=reason,
                  submission_state='NOT_SUBMITTED')
+        if reason in ('blocked_existing_unconfirmed_no_submit', 'submission_journal_unavailable_no_submit'):
+            r['skipped'] = True
+            if rows:
+                r['submission_blocker'] = rows[-1].get('blocker') or {}
+                r['message'] = rows[-1].get('explanation') or reason
     elif dispatched:
         state = 'CLICK_UNKNOWN' if any(a.get('state') in ('CLICK_STARTED', 'CLICK_UNKNOWN') for a in dispatched) else 'CLICKED'
         r.update(submit_attempted=True, submission_state=state, no_submit=False)
@@ -234,7 +239,7 @@ def pending_blocks(record):
     if not isinstance(record, dict) or not record:
         return False
     return str(record.get('state') or '').upper() not in (
-        'CONFIRMED_SUCCESS', 'CONFIRMED_REJECTED', 'CONFIRMED_CANCELLED', 'CONFIRMED_NOT_FILLED')
+        'CONFIRMED_SUCCESS', 'CONFIRMED_REJECTED', 'CONFIRMED_CANCELLED', 'CONFIRMED_NOT_FILLED', 'RESOLVED_FLAT')
 
 
 def verify_pending_settlement(record, post):

@@ -1,4 +1,4 @@
-"""Preview legacy pending settlements from explicit position evidence.
+"""Plan legacy pending settlements from explicit position evidence.
 
 Pure functions only. This module does not write a live journal, create fills,
 change grid layers, move an anchor, or submit orders.
@@ -21,6 +21,47 @@ EMPTY_INTERVAL = 30.0
 MIN_ORDER_AGE = 120.0
 
 
+def snapshot_is_fresh(snapshot, *, now):
+    s = snapshot if isinstance(snapshot, dict) else {}
+    meta = s.get('meta') or {}
+    ts = finite_number(s.get('ts'))
+    return bool(s.get('data_quality') == 'ok' and ts is not None and 0 <= now-ts <= MAX_SCAN_AGE
+        and not s.get('dq_fallback') and not s.get('stale') and not s.get('recovered_from_last_good')
+        and not meta.get('cache_hit') and not meta.get('postcheck_direct_read')
+        and str(s.get('scan_scope') or meta.get('scan_scope') or meta.get('scope') or '').lower() not in ('local','partial'))
+
+
+def decision_text(detail):
+    names = {
+        'already_terminal':'已结算，保留原状态',
+        'separate_m9_m10_confirmation_policy':'M9/M10 专用确认保留，未套用旧首仓规则',
+        'not_legacy_open_scope':'不属于旧首仓记录，保留原确认规则',
+        'snapshot_not_fresh_or_complete':'扫描过期、早于提交或不完整，继续等待',
+        'position_unavailable_or_not_covered':'本次未可靠读到该币，不能当作空仓',
+        'position_side_mismatch':'当前方向与原单相反，继续等待',
+        'position_quantity_unavailable':'数量证据缺失，继续等待',
+        'intent_or_notional_unavailable':'原金额或当前持仓金额缺失',
+        'position_below_half_intent':'当前同向持仓不足原金额的 50%',
+        'legacy_same_side_at_least_half_intent':'同向持仓达到原金额的 50%，结算旧首仓占位',
+        'known_baseline_quantity_delta':'持仓数量增量已确认',
+        'later_confirmed_platform_close_and_fresh_empty':'后来已有全平证据，本次再次确认空仓',
+        'working_order_not_resolved':'仍有活动订单证据，不解除',
+        'duplicate_empty_snapshot':'重复快照不累计空仓次数',
+        'empty_scans_too_close':'空仓扫描间隔不足 30 秒',
+        'needs_three_fresh_empty_scans':'等待三次独立新鲜空仓证据及至少两分钟订单年龄',
+        'observed_position_now_flat':'曾有持仓，现已连续三次确认空仓',
+        'no_fill_after_three_fresh_empty_scans':'连续三次新鲜空仓，推定未成交',
+        'fresh_close_scope_empty':'平仓范围已确认空仓，结算平仓占位',
+        'close_scope_not_confirmed_empty':'平仓范围尚未确认空仓，继续保护',
+    }
+    text = names.get(detail['reason'],detail['reason'])
+    if detail.get('current_notional_u') is not None:
+        text += f"；当前={detail.get('current_side') or '-'} {detail['current_notional_u']:g}U"
+    if detail.get('minimum_required_u') is not None:text += f"；门槛={detail['minimum_required_u']:g}U"
+    if detail.get('empty_scan_count') is not None:text += f"；空仓证据={detail['empty_scan_count']}/3"
+    return text
+
+
 def fingerprint(record):
     raw = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
@@ -28,6 +69,19 @@ def fingerprint(record):
 
 def position_for(snapshot, platform, coin):
     """Absent from a filtered export is UNAVAILABLE, never inferred empty."""
+    raw = snapshot.get('raw') or {}
+    details = (raw.get('platform_empty_detail_map') or {}).get(platform) or {}
+    if coin == 'ALL':
+        # ALL is an account scope, never a symbol absent from a nonempty table.
+        if details.get('confirmed_empty') is True:
+            for bucket in ('raw_positions', 'positions'):
+                value = snapshot.get(bucket) or {}
+                rows = value.get(platform, {}) if isinstance(value, dict) else {
+                    str(i):r for i,r in enumerate(value) if isinstance(r,dict) and r.get('platform')==platform}
+                if any(position_read(r)[0] == 'FOUND' for r in rows.values()):
+                    return {'position_state':'UNAVAILABLE','reason':'conflicting_platform_empty_evidence'}
+            return {'position_state':'CONFIRMED_EMPTY','reason':'explicit_platform_empty'}
+        return {'position_state':'UNAVAILABLE','reason':'whole_platform_empty_not_confirmed'}
     for bucket in ('raw_positions', 'positions'):
         positions = snapshot.get(bucket)
         rows = positions.get(platform) if isinstance(positions, dict) else positions
@@ -42,10 +96,14 @@ def position_for(snapshot, platform, coin):
     for row in snapshot.get(platform, []) if isinstance(snapshot.get(platform), list) else []:
         if isinstance(row, dict) and same_symbol(coin, row.get('coin')):
             return row
-    raw = snapshot.get('raw') or {}
-    details = (raw.get('platform_empty_detail_map') or {}).get(platform) or {}
     if details.get('confirmed_empty') is True:
         return {'position_state': 'CONFIRMED_EMPTY', 'reason': 'explicit_platform_empty'}
+    coverage = (raw.get('platform_position_coverage') or {}).get(platform) or {}
+    if (coverage.get('complete') is True and coverage.get('source') == 'verified_positions_table'
+            and isinstance(coverage.get('coins'), list)
+            and not any(same_symbol(coin, c) for c in coverage['coins'])):
+        return {'position_state':'CONFIRMED_EMPTY','reason':'verified_complete_table_absent',
+                'ts':coverage.get('ts')}
     return {'position_state': 'UNAVAILABLE', 'reason': 'symbol_not_covered_by_snapshot'}
 
 
@@ -54,7 +112,7 @@ def _fresh(snapshot, record, row, now):
     submitted = finite_number(record.get('ts'))
     meta = snapshot.get('meta') or {}
     if (snapshot.get('data_quality') != 'ok' or snapshot.get('dq_fallback') or snapshot.get('stale')
-            or snapshot.get('recovered_from_last_good') or meta.get('cache_hit')
+            or snapshot.get('recovered_from_last_good') or meta.get('cache_hit') or meta.get('postcheck_direct_read')
             or str(snapshot.get('scan_scope') or meta.get('scan_scope') or meta.get('scope') or '').lower() in ('local', 'partial')
             or ts is None or submitted is None or not submitted < ts <= now or now - ts > MAX_SCAN_AGE):
         return False
@@ -66,11 +124,15 @@ def _fresh(snapshot, record, row, now):
 def confirmed_platform_closes(records):
     result = {}
     for record in records.values():
-        if (record.get('state') == 'CONFIRMED_SUCCESS' and record.get('coin') == 'ALL'
+        if (record.get('state') == 'CONFIRMED_SUCCESS'
                 and str(record.get('kind') or '').startswith('close')):
             ts = finite_number(record.get('resolved_ts'))
             if ts is not None:
                 p = str(record.get('platform') or '')
+                if record.get('coin') != 'ALL':
+                    if position_read(record.get('pre_position'))[0] != 'FOUND':
+                        continue
+                    p += '|' + str(record.get('coin') or '')
                 result[p] = max(result.get(p, 0), ts)
     return result
 
@@ -111,6 +173,13 @@ def reconcile(record, snapshot, *, now, scan_id, platform_closes=None):
         return finish('already_terminal')
     if r.get('m10_step3_confirmation') or str(r.get('module') or '').upper() in ('M9', 'M10'):
         return finish('separate_m9_m10_confirmation_policy')
+    if str(r.get('kind') or '').startswith('close'):
+        if _fresh(snapshot, r, row, now) and state == 'CONFIRMED_EMPTY':
+            # No fabricated trade: an unsubmitted legacy aggregate is merely flat.
+            ok, ev = verify_pending_settlement(r, row)
+            return finish('fresh_close_scope_empty', 'CONFIRMED_SUCCESS' if ok else 'RESOLVED_FLAT',
+                          quantity_evidence=ev)
+        return finish('close_scope_not_confirmed_empty')
     if str(r.get('kind') or '').lower() != 'open' or str(r.get('module') or '').upper() not in ('', 'B1'):
         return finish('not_legacy_open_scope')
     if not _fresh(snapshot, r, row, now):
@@ -141,8 +210,10 @@ def reconcile(record, snapshot, *, now, scan_id, platform_closes=None):
     submitted = finite_number(r.get('ts')) or 0
     ts = float(snapshot['ts'])
     progress = dict(r.get('empty_scan_evidence') or {})
-    seen = bool(progress.get('position_seen') or has_fill_evidence(r) or before_state == 'FOUND')
-    closed_after = (platform_closes or {}).get(p, 0)
+    coin_close = (platform_closes or {}).get(p + '|' + c, 0)
+    seen = bool(progress.get('position_seen') or has_fill_evidence(r) or before_state == 'FOUND'
+                or submitted < coin_close <= ts)
+    closed_after = max((platform_closes or {}).get(p, 0), coin_close)
     if r.get('open_order_active') is True:
         reset_empty('working_order_not_resolved')
         return finish('working_order_not_resolved')

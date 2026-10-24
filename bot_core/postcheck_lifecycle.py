@@ -17,6 +17,30 @@ EMPTY_SCAN_INTERVAL_SEC = 30.0
 SCAN_MAX_AGE_SEC = 90.0
 
 
+def confirmed_full_close_result(request, results):
+    """A current request's two live flat reports outrank an ALL-symbol lookup."""
+    from .close_flow import is_full_close_batch
+    req = request if isinstance(request, dict) else vars(request)
+    if not is_full_close_batch([req]):
+        return None
+    identity = req.get('req_id') or (req.get('meta') or {}).get('req_id')
+    if not identity:
+        return None
+    for result in results or []:
+        other = result.get('req') or {}
+        other_id = other.get('req_id') or (other.get('meta') or {}).get('req_id')
+        reports = result.get('close_platforms') or {}
+        if identity != other_id or not result.get('ok') or result.get('postcheck_ok') is not True:
+            continue
+        if all(isinstance(reports.get(p), dict) and reports[p].get('ok') is True
+               and reports[p].get('flat_confirmed') is True and not reports[p].get('error')
+               and not reports[p].get('remaining_coins') and not reports[p].get('unverified_coins')
+               for p in ('EXT', 'VAR')):
+            return {'reason':'both_platforms_live_flat_confirmed', 'close_platforms':reports,
+                    'request_id':identity, 'effective':True}
+    return None
+
+
 def verification_budget(payload, *, now, monotonic=None):
     """The original start/deadline never moves when a check is rescheduled."""
     p = payload if isinstance(payload, dict) else {}

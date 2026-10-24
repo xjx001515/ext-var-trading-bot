@@ -239,6 +239,8 @@ class JournalAndSubmitTests(unittest.TestCase):
         before=copy.deepcopy(env['_safety_submission_records']()['EXT|TIA'])
         pre={'ext_side':'SHORT','ext_qty':17,'ext_notional_u':170,'ext_position_state':'FOUND'}
         req=request(module='M9',action_type='decrease',side='BUY',amount_usd=40)
+        env['_safety_reserve_submission']('EXT','TIA','SHORT','close',row(),40,
+            reason='submit_click_dispatched',submission_attempt_id='close-click',module='M9')
         self.assertTrue(env['_postcheck_defer_to_scan'](req,payload={'pre_state':pre,'created_ts':clock.time()}))
         recs=env['_safety_submission_records']()
         self.assertEqual(recs['EXT|TIA'],before)

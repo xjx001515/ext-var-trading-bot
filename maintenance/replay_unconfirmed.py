@@ -11,29 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from bot_core.legacy_reconciliation import replay
-
-
-REASONS = {
-    'already_terminal':'已结算，保留原状态',
-    'separate_m9_m10_confirmation_policy':'M9/M10 专用确认，保留数量增量校验，不套用 50% 规则',
-    'not_legacy_open_scope':'非旧开仓记录，保持原确认规则',
-    'snapshot_not_fresh_or_complete':'快照过期、早于提交或不完整，需要新的完整扫描',
-    'position_unavailable_or_not_covered':'此快照未可靠覆盖该币，缺失不能视为空仓',
-    'position_side_mismatch':'当前方向与原意图相反，继续待确认',
-    'position_quantity_unavailable':'没有可靠的持仓数量，继续待确认',
-    'intent_or_notional_unavailable':'意图金额或当前名义金额不可用',
-    'position_below_half_intent':'同向仓位低于原意图金额的 50%',
-    'legacy_same_side_at_least_half_intent':'同向仓位达到原意图金额的 50%，仅结算旧占位',
-    'known_baseline_quantity_delta':'有下单前数量，按数量增量确认',
-    'later_confirmed_platform_close_and_fresh_empty':'后来已有平台全平成功证据，且此快照明确空仓',
-    'working_order_not_resolved':'仍有活动订单证据，不解除',
-    'duplicate_empty_snapshot':'同一空仓快照不能重复累计，需要下一次独立扫描',
-    'empty_scans_too_close':'空仓扫描间隔不足 30 秒',
-    'needs_three_fresh_empty_scans':'独立新鲜空仓证据不足三次或订单年龄不足两分钟',
-    'observed_position_now_flat':'曾观测到持仓，连续三次新鲜扫描确认现已空仓',
-    'no_fill_after_three_fresh_empty_scans':'无已成交/活动订单证据，连续三次新鲜空仓推定未成交',
-}
+from bot_core.legacy_reconciliation import replay, decision_text
 
 
 def run(journal_path, positions_path, output_dir=None, *, as_of=None):
@@ -61,7 +39,7 @@ def run(journal_path, positions_path, output_dir=None, *, as_of=None):
         scan_id='replay:' + hashlib.sha256(snapshot_raw).hexdigest())
     counts = dict(Counter(r['proposed_state'] for r in decisions))
     changes = [r for r in decisions if r['proposed_state'] != r['original_state']]
-    result = {'mode':'preview_only','runtime_auto_reconciliation_enabled':False,
+    result = {'mode':'preview_only','writes_live_journal':False,
         'replayed_at':datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(),
         'uses_snapshot_time_as_replay_clock':as_of is None,'total_records':len(decisions),
         'proposed_state_counts':counts,'changed_records':len(changes),
@@ -78,11 +56,7 @@ def run(journal_path, positions_path, output_dir=None, *, as_of=None):
         '序号 | 记录键 | 原状态 -> 建议状态 | 快照中的方向/名义金额 | 依据']
     for i,row in enumerate(decisions,1):
         value=row['current_notional_u'];value='-' if value is None else f'{value:.4f} U'
-        reason=REASONS.get(row['reason'],row['reason'])
-        if row.get('minimum_required_u') is not None:
-            reason+=f"；门槛={row['minimum_required_u']:.4f} U"
-        if row.get('empty_scan_count') is not None:
-            reason+=f"；已累计={row['empty_scan_count']}/3"
+        reason=decision_text(row)
         lines.append(f"{i:02d} | {row['record_key']} | {row['original_state']} -> {row['proposed_state']} | {row['current_side'] or '-'} / {value} | {reason}")
     outputs[1].write_text('\n'.join(lines)+'\n',encoding='utf-8')
     return result, folder

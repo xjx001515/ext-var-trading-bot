@@ -138,6 +138,7 @@ class AdapterTests(unittest.TestCase):
         import os
         ns={'Any':object, 'os':os, '_safety_pending_scope':lambda *a:pending(),
             '_submit_attempt_begin':lambda order:None, '_submit_attempt_set':lambda *a,**k:None,
+            '_submission_blocker_detail':lambda *a,**k:{'code':'blocked_existing_unconfirmed_no_submit','message':'existing claim'},
             '_set_last_exec_err':lambda **k:None, '_pw_guard':lambda **k:True,
             '_runtime_recovering_gate':lambda *a,**k:(True,'',{}),
             '_a1_norm_side':lambda x:'LONG', '_failed_close_pending_should_block_new_open':lambda *a:(False,{})}

@@ -86,6 +86,7 @@ def namespace(directory):
            '_apply_submission_evidence':apply_submission_evidence,
            '_result_apply_confirmation_fields':apply_confirmation_fields}
     names = {'_safety_submission_records','_safety_submission_save','_safety_pending_scope',
+             '_submission_blocker_detail',
              '_safety_reserve_submission','_safety_click_submit_once','_req_ensure_meta',
              '_submit_attempt_begin','_submit_attempt_set','_submit_margin_precheck',
              '_submit_order_click','_funding_margin_status','_exe_open_position_safe',
