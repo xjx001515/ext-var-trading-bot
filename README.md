@@ -1,8 +1,18 @@
-# EXT / VAR 双平台交易机器人
+# EXT / VAR 双平台交易机器人 | Trading Bot
+
+## 简介 / Overview
+
+**中文**
 
 基于 Python 与 Playwright/CDP 的 EXT（Extended）、VAR（Variational）双平台交易机器人，包含桌面控制面板、资金与持仓扫描、策略执行、订单确认、浏览器页面恢复和离线回归测试。
 
 本仓库保存当前维护版本的源码。程序正逐步将主文件中的公共逻辑拆分到 `bot_core/`，保留现有策略、金额与方向规则。
+
+**English**
+
+A Python trading bot for Extended (EXT) and Variational (VAR), built with Playwright and a local Edge CDP connection. It includes a desktop dashboard, account and position scanning, strategy execution, order confirmation, browser page recovery, and offline regression tests.
+
+This repository contains the current maintenance version. Shared logic is being extracted into `bot_core/` while preserving the existing strategy, order sizing, and direction rules. Reconciliation of legacy pending orders is still planned; the maintenance status and test limitations are documented below.
 
 ## 主要功能
 
