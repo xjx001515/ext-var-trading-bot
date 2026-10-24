@@ -12,12 +12,15 @@
 
 A Python trading bot for Extended (EXT) and Variational (VAR), built with Playwright and a local Edge CDP connection. It includes a desktop dashboard, account and position scanning, strategy execution, order confirmation, browser page recovery, and offline regression tests.
 
+The log viewer updates incrementally and preserves your reading position and text selection while new entries arrive. Background data collection keeps scrolling responsive; use “回到最新” (Latest) to resume following the log.
+
 This repository contains the current maintenance version. Shared logic is being extracted into `bot_core/` while preserving the existing strategy, order sizing, and direction rules. Reconciliation of legacy pending orders is still planned; the maintenance status and test limitations are documented below.
 
 ## 主要功能
 
 - 通过本地 Edge 的 CDP 连接读取交易页面，扫描资金、持仓及指标。
 - 通过桌面面板展示运行状态、资金和收益信息。
+- 日志增量刷新，上翻时保留阅读和复制位置；后台采集数据，支持“回到最新”恢复跟随。
 - 执行 B1、M9、M10、锚点全平等现有流程。
 - 根据持仓数量变化确认执行结果，保存未确认订单并防止重复提交。
 - 分开管理开仓与平仓待确认记录，避免开仓记录阻挡减仓和全平。
@@ -62,6 +65,7 @@ py -3.14 -m venv .venv
 截至 2026-10-24：
 
 - 已完成待确认拦截第一阶段：按操作类型隔离，开仓和平仓记录分开保存，同币同方向重复平仓继续受保护。
+- 已优化面板日志：移除定时全量重画和三分钟自动跳回，新增分批插入、滚动事件合并、隐藏插页按需刷新。
 - 锚点全平结果分支要求 EXT、VAR 均成功且确认空仓，才提交锚点更新；失败记录平台和残留或无法确认的币种。
 - 旧待确认记录批量对账、启动对账与手动结算命令属于第二阶段，尚未实现。
 - 保证金界面字段读取仍可能出现无法识别的情况。当前约定是读取失败时沿用原流程，按钮禁用时停止提交。
@@ -73,8 +77,9 @@ py -3.14 -m venv .venv
 本次维护在原本机环境执行的结果：
 
 - 主程序及相关模块 `ast.parse` 语法检查通过。
-- Python 全量 425 项：424 项通过，1 项既有历史快照用例失败。
+- Python 全量 451 项：450 项通过，1 项既有历史快照用例失败。
 - 新增的待确认隔离测试 25 项全部通过。
+- 新增的面板日志与后台刷新测试 26 项全部通过，使用独立隐藏 Tk 控件和模拟采集器。
 - 合成 DOM 界面解析测试 7 项全部通过。
 
 既有失败为 `tests/test_recorded_incidents.py` 中的 `test_oct22_zero_snapshot_is_rejected_as_unknown`：它读取本机运行中的 `out/positions.json`、`out/equity.json`，当前数据已不同于原来的历史异常快照。

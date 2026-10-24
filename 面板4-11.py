@@ -40,6 +40,8 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import copy
 from bot_core import panel_state as _panel_state
+from bot_core import panel_log as _panel_log
+import threading
 
 # Word 日报输出不再依赖 python-docx，避免用户本机缺模块直接秒退。
 # 如环境已安装 python-docx，也不强依赖，统一走内置无依赖 docx 生成器。
@@ -5988,16 +5990,18 @@ class PanelModel:
                 return [], []
             st = fp_full.stat()
             cache = getattr(self, "_full_log_cache", None) or {}
-            if cache.get("path") == str(fp_full) and cache.get("mtime") == float(st.st_mtime) and cache.get("size") == int(st.st_size):
+            if cache.get("path") == str(fp_full) and cache.get("mtime") == float(st.st_mtime) and cache.get("size") == int(st.st_size) and cache.get("limits") == (display_lines, parse_lines):
                 return list(cache.get("display_lines") or []), list(cache.get("parse_lines") or [])
-            disp = _slice_recent_rounds(_tail_lines(fp_full, max_lines=int(display_lines)))
-            pars = _slice_recent_rounds(_tail_lines(fp_full, max_lines=int(parse_lines)))
+            tail = _tail_lines(fp_full, max_lines=max(int(display_lines), int(parse_lines)))
+            disp = _slice_recent_rounds(tail[-int(display_lines):])
+            pars = _slice_recent_rounds(tail[-int(parse_lines):])
             self._full_log_cache = {
                 "path": str(fp_full),
                 "mtime": float(st.st_mtime),
                 "size": int(st.st_size),
                 "display_lines": disp,
                 "parse_lines": pars,
+                "limits": (display_lines, parse_lines),
             }
             return disp, pars
         except Exception:
@@ -7207,8 +7211,7 @@ class PanelModel:
                     grid_fp = _p
                     break
             meta = f"人类日志：{str(fp_full) if fp_full else "-"} | 机器日志：{str(fp_actions) if fp_actions else "-"} | 网格数据：{str(grid_fp) if grid_fp else "-"}"
-            if hasattr(self, "var_log_meta"):
-                self.var_log_meta.set(meta)
+            self.log_meta = meta  # Model collection runs off the Tk thread.
             self.data_status["paths"]["human_log"] = str(fp_full) if fp_full else ""
             self.data_status["paths"]["machine_log"] = str(fp_actions) if fp_actions else ""
             self.data_status["paths"]["grid_data"] = str(grid_fp) if grid_fp else ""
@@ -7778,6 +7781,8 @@ class PanelModel:
             "ls_ratio_summary_lines": ls_ratio_summary_lines,
             "ls_ratio_coin_rows": ls_ratio_coin_rows,
             "status": dict(self.data_status),
+            "panel_status": panel_status,
+            "log_meta": getattr(self, 'log_meta', ''),
             "browser_recovery_alert": str((panel_status or {}).get('browser_recovery_alert') or ''),
             "funds_imbalance_alert": str((panel_status or {}).get('funds_imbalance_alert') or ''),
         }
@@ -7788,6 +7793,15 @@ class PanelUI:
         self.root = root
         self.model = model
         self.bot = BotProc()
+        self._refresh_worker = _panel_log.SnapshotWorker()
+        self._refresh_model_lock = threading.RLock()
+        self._refresh_generation = 0
+        self._next_refresh_at = 0.0
+        self._refresh_job = None
+        self._latest_panel_data = {}
+        self._last_log_lines = ()
+        self._log_filter_job = None
+        self.root.bind('<Destroy>', self._on_panel_destroy, add='+')
 
         self.root.title(APP_NAME)
         self.root.geometry("1500x900")
@@ -8922,6 +8936,7 @@ class PanelUI:
         self.nb_right.add(self.tab_trend_observe, text="趋势观察")
         self.nb_right.add(self.tab_selection_observe, text="选币排名")
         self.nb_right.pack(fill="both", expand=True, padx=0, pady=0)
+        self.nb_right.bind('<<NotebookTabChanged>>', lambda event: self._render_visible_tab(), add='+')
         try:
             self.root.after(120, self._apply_main_pane_ratio)
         except Exception:
@@ -8932,7 +8947,12 @@ class PanelUI:
         # 左：全量日志（占用剩余空间）
         log_box = ttk.Frame(left, style="Card.TFrame")
         log_box.pack(fill="both", expand=True, padx=10, pady=(10, 6))
-        ttk.Label(log_box, text="全量日志", style="CardTitle.TLabel").pack(anchor="w", padx=10, pady=(8, 2))
+        log_header = ttk.Frame(log_box, style="Card.TFrame")
+        log_header.pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Label(log_header, text="全量日志", style="CardTitle.TLabel").pack(side="left")
+        ttk.Button(log_header, text="回到最新", command=lambda: self._log_view.follow_latest()).pack(side="right")
+        self.var_log_follow = tk.StringVar(value="跟随最新")
+        ttk.Label(log_header, textvariable=self.var_log_follow, style="Hint.TLabel").pack(side="right", padx=8)
         self.var_log_meta = tk.StringVar(value="来源：等待日志...")
         ttk.Label(log_box, textvariable=self.var_log_meta, style="Hint.TLabel", wraplength=560, justify="left").pack(anchor="w", padx=10, pady=(0, 4))
 
@@ -8956,13 +8976,6 @@ class PanelUI:
             relief="flat", wrap="char",
             font=("Consolas", 9)
         )
-        self._log_manual_scroll_until = 0.0
-        self._log_manual_scroll_secs = 180.0
-        self._log_scroll_debounce_ms = 180
-        self._log_restore_job = None
-        self._log_last_render_ts = 0.0
-        self._log_auto_follow_eps = 0.003
-
         # 全量日志高亮：
         # 1) 开仓/加仓/补仓/B1 首开 → 红色加粗
         # 2) 平仓/减仓/双平/M10 减亏 → 绿色加粗
@@ -8979,72 +8992,11 @@ class PanelUI:
         except Exception:
             pass
 
-        def _log_clear_manual_scroll() -> None:
-            try:
-                self._log_manual_scroll_until = 0.0
-                if getattr(self, "_log_restore_job", None):
-                    try:
-                        self.after_cancel(self._log_restore_job)
-                    except Exception:
-                        pass
-                self._log_restore_job = None
-            except Exception:
-                pass
-
-        def _log_mark_manual_scroll(*_args):
-            try:
-                import time as _time
-                self._log_manual_scroll_until = _time.time() + float(getattr(self, "_log_manual_scroll_secs", 180.0))
-                if getattr(self, "_log_restore_job", None):
-                    try:
-                        self.after_cancel(self._log_restore_job)
-                    except Exception:
-                        pass
-                delay = int(float(getattr(self, "_log_manual_scroll_secs", 180.0)) * 1000)
-                self._log_restore_job = self.after(delay, _log_clear_manual_scroll)
-            except Exception:
-                pass
-
-        def _log_is_near_bottom() -> bool:
-            try:
-                _y0, _y1 = self.txt_full.yview()
-                return float(_y1) >= (0.999 - float(getattr(self, "_log_auto_follow_eps", 0.003) or 0.003))
-            except Exception:
-                return True
-
-        def _log_sync_follow_state() -> None:
-            try:
-                if _log_is_near_bottom():
-                    _log_clear_manual_scroll()
-                else:
-                    _log_mark_manual_scroll()
-            except Exception:
-                pass
-
-        def _yview_with_manual(*args):
-            try:
-                ret = self.txt_full.yview(*args)
-            except Exception:
-                ret = None
-            try:
-                self.root.after_idle(_log_sync_follow_state)
-            except Exception:
-                _log_sync_follow_state()
-            return ret
-
-        def _xview_with_manual(*args):
-            try:
-                ret = self.txt_full.xview(*args)
-            except Exception:
-                ret = None
-            try:
-                self.root.after_idle(_log_sync_follow_state)
-            except Exception:
-                _log_sync_follow_state()
-            return ret
-
-        scy = ttk.Scrollbar(log_box, orient="vertical", command=_yview_with_manual)
-        scx = ttk.Scrollbar(log_box, orient="horizontal", command=_xview_with_manual)
+        self._log_view = _panel_log.LogView(self.txt_full, self._format_log_source, self.var_log_follow.set)
+        self.var_log_mode.trace_add('write', self._queue_log_filter)
+        self.var_log_kw.trace_add('write', self._queue_log_filter)
+        scy = ttk.Scrollbar(log_box, orient="vertical", command=self._log_view.scroll)
+        scx = ttk.Scrollbar(log_box, orient="horizontal", command=self.txt_full.xview)
         self.txt_full.configure(yscrollcommand=scy.set, xscrollcommand=scx.set)
         self.txt_full.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
         scy.pack(side="right", fill="y", padx=(0, 10), pady=(0, 10))
@@ -9070,12 +9022,6 @@ class PanelUI:
             _corner_bg = "#0b0b0c"
         self._log_scroll_corner_mask = tk.Frame(log_box, bd=0, highlightthickness=0, bg=_corner_bg)
         self._log_scroll_corner_mask.place(relx=1.0, rely=1.0, x=-10, y=-10, anchor="se", width=_sb_w, height=_sb_h)
-        for _ev in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<Shift-MouseWheel>", "<ButtonPress-1>", "<B1-Motion>", "<Key-Prior>", "<Key-Next>", "<Home>", "<End>"):
-            try:
-                self.txt_full.bind(_ev, lambda _e: (self.root.after_idle(_log_sync_follow_state), None)[1], add="+")
-            except Exception:
-                pass
-
         # 右：上半摘要、下半 多空比（为保证 8 币全可见，给下半区固定最小高度，避免被挤压）
         top_r = ttk.Frame(right, style="Card.TFrame")
         bot_r = ttk.Frame(right, style="Card.TFrame", height=360)
@@ -11354,13 +11300,19 @@ class PanelUI:
         fp = filedialog.askopenfilename(title="选择 Bot 脚本", filetypes=[("Python", "*.py"), ("All", "*.*")])
         if not fp:
             return
-        self.model.set_bot_script(fp)
+        with self._refresh_model_lock:
+            self.model.set_bot_script(fp)
+            self._refresh_generation += 1
+            self._next_refresh_at = 0.0
 
     def on_choose_data_dir(self) -> None:
         folder = filedialog.askdirectory(title="选择数据目录（包含 out/logs 的目录）")
         if not folder:
             return
-        self.model.choose_data_dir(folder)
+        with self._refresh_model_lock:
+            self.model.choose_data_dir(folder)
+            self._refresh_generation += 1
+            self._next_refresh_at = 0.0
 
 
     def on_apply_profile(self) -> None:
@@ -11714,12 +11666,80 @@ class PanelUI:
 
         self.mini_win.protocol("WM_DELETE_WINDOW", _on_close)
 
+    def _format_log_source(self, source, key):
+        mode, keyword, _path = key
+        if mode == 'all' and not keyword:
+            return "\n".join(source)
+        lines = _humanize_and_filter_logs(source, mode=mode, keyword=keyword)
+        return ("\n\n" if mode == 'human' else "\n").join(lines)
+
+    def _update_log_view(self, lines):
+        self._last_log_lines = tuple(lines or ())
+        paths = (self._latest_panel_data.get('status') or {}).get('paths') or {}
+        source_path = paths.get('human_log') or str(getattr(self.model, 'bot_dir', ''))
+        key = (self.var_log_mode.get(), self.var_log_kw.get(), source_path)
+        self._log_view.set_source(self._last_log_lines, key)
+
+    def _queue_log_filter(self, *_args):
+        if self._log_filter_job is not None:
+            self.root.after_cancel(self._log_filter_job)
+        def apply_filter():
+            self._log_filter_job = None
+            self._update_log_view(self._last_log_lines)
+        self._log_filter_job = self.root.after(150, apply_filter)
+
+    def _collect_panel_snapshot(self, generation):
+        with self._refresh_model_lock:
+            return generation, copy.deepcopy(self.model.refresh())
+
+    def _on_panel_destroy(self, event):
+        if event.widget is self.root:
+            self._refresh_worker.close()
+            for name in ('_refresh_job', '_log_filter_job'):
+                job = getattr(self, name, None)
+                if job is not None:
+                    try:
+                        self.root.after_cancel(job)
+                    except Exception:
+                        pass
+                    setattr(self, name, None)
+
+    def _render_visible_tab(self, data=None):
+        data = data if isinstance(data, dict) else self._latest_panel_data
+        selected = self.nb_right.select()
+        actions = (
+            ('tab_grid', self._render_grid_tab, False, 'var_grid_status'),
+            ('tab_grid_book', self._render_grid_book_tab, False, 'var_grid_book_status'),
+            ('tab_trend_observe', self._render_trend_observe_tab, True, 'var_trend_observe_status'),
+            ('tab_selection_observe', self._render_selection_observe_tab, True, 'var_selection_observe_status'),
+        )
+        for tab, render, with_status, status in actions:
+            if selected == str(getattr(self, tab, '')):
+                try:
+                    render(data.get('panel_status') or {}) if with_status else render()
+                except Exception as exc:
+                    variable = getattr(self, status, None)
+                    if variable is not None:
+                        variable.set(f'面板渲染异常：{exc}')
+                break
+
     def _refresh_loop(self) -> None:
         try:
-            data = self.model.refresh()
-            self._render(data)
+            result = self._refresh_worker.take()
+            if result is not None:
+                payload, error = result
+                if error is not None:
+                    raise error
+                generation, data = payload
+                if generation == self._refresh_generation:
+                    self._latest_panel_data = data
+                    self._render(data)
+                    self._next_refresh_at = time.monotonic() + max(200, int(self.model.cfg.refresh_ms or REFRESH_MS)) / 1000.0
+            if time.monotonic() >= self._next_refresh_at:
+                generation = self._refresh_generation
+                self._refresh_worker.start(lambda: self._collect_panel_snapshot(generation))
         except Exception as e:
-            # 任何异常都写到状态栏（避免“没数据但无原因”）
+            self._next_refresh_at = time.monotonic() + max(200, int(self.model.cfg.refresh_ms or REFRESH_MS)) / 1000.0
             msg = f"面板异常：{e}"
             self.var_status.set(msg)
             try:
@@ -11729,7 +11749,7 @@ class PanelUI:
                     messagebox.showerror("面板异常", msg)
             except Exception:
                 pass
-        self.root.after(max(200, int(self.model.cfg.refresh_ms or REFRESH_MS)), self._refresh_loop)
+        self._refresh_job = self.root.after(50, self._refresh_loop)
 
     def _maybe_beep(self, data: dict) -> None:
         """只在两种情况下提示音：
@@ -13576,120 +13596,10 @@ class PanelUI:
             except Exception:
                 pass
 
-# 全量日志（左下）
+        # Full log updates preserve the document while the user reads history.
+        self._update_log_view(log_full)
         try:
-            mode = getattr(self, "var_log_mode", tk.StringVar(value="focus")).get()
-            kw = getattr(self, "var_log_kw", tk.StringVar(value="")).get()
-
-            # 关键：默认 all 视图要“尽量等于命令行”，不要二次 humanize
-            if (mode == "all") and (not kw):
-                view_lines = log_full or []
-                txt = "\n".join(view_lines)
-            else:
-                view_lines = _humanize_and_filter_logs(log_full, mode=mode, keyword=kw)
-                txt = "\n\n".join(view_lines) if mode == "human" else "\n".join(view_lines)
-
-            cur = self.txt_full.get("1.0", "end-1c")
-            if cur != txt:
-                import time as _time
-                _now_ts = _time.time()
-                try:
-                    _y0, _y1 = self.txt_full.yview()
-                    _x0, _x1 = self.txt_full.xview()
-                    _was_at_bottom = float(_y1) >= (0.999 - float(getattr(self, "_log_auto_follow_eps", 0.003) or 0.003))
-                except Exception:
-                    _y0, _y1, _x0, _x1 = 1.0, 1.0, 0.0, 1.0
-                    _was_at_bottom = True
-                _manual_hold = ((_now_ts < float(getattr(self, "_log_manual_scroll_until", 0.0) or 0.0)) and (not _was_at_bottom))
-                if (_now_ts - float(getattr(self, "_log_last_render_ts", 0.0) or 0.0)) * 1000.0 < float(getattr(self, "_log_scroll_debounce_ms", 180)):
-                    return
-                self._log_last_render_ts = _now_ts
-                self.txt_full.delete("1.0", "end")
-
-                def _pick_tag(line: str) -> Optional[str]:
-                    try:
-                        s = str(line or "")
-                        if not s:
-                            return None
-                        sl = s.lower()
-                        su = s.upper()
-
-                        # 报错/警告优先级最高
-                        if any(x in sl for x in ("error", "exception", "traceback")) or ("错误" in s):
-                            return "tag_red_bold"
-                        if ("warn" in sl) or ("警告" in s):
-                            return "tag_yellow_bold"
-                        if ("扫描开始" in s) or ("扫描结束" in s) or ("预计下次扫描" in s) or ("持仓进度" in s) or ("扫描进度" in s):
-                            return "tag_blue_bold"
-                        if ("[STANDBY]" in s) or ("module_disabled" in s):
-                            return "tag_gray"
-
-                        mm = re.search(r"\bmodule=([A-Za-z0-9_+\-]+)", s)
-                        mod_u = (mm.group(1) if mm else "").upper()
-                        ma = re.search(r"\baction=([A-Za-z0-9_+\-]+)", s)
-                        act_l = (ma.group(1) if ma else "").lower()
-                        related_mod = any(k in su for k in ("M10", "B2", "M9", "B1")) or any(k in mod_u for k in ("M10", "B2", "M9", "B1"))
-
-                        close_hit = (
-                            ("平仓" in s) or ("减仓" in s) or ("全平" in s) or ("双平" in s) or ("止盈" in s) or ("减亏" in s)
-                            or bool(re.search(r"/L\d+[平减]", s))
-                            or act_l.startswith("close") or ("close" in act_l) or (act_l in ("reduce", "decrease", "take_profit", "tp", "close_pair", "close_full", "close_partial"))
-                        )
-                        open_hit = (
-                            ("开仓" in s) or ("加仓" in s) or ("补仓" in s) or ("补腿" in s) or ("回补" in s) or ("首开" in s)
-                            or bool(re.search(r"/L\d+[开加]", s))
-                            or act_l.startswith("open") or ("open" in act_l) or (act_l in ("increase", "add", "add_layer", "add_leg", "fix_leg", "first_open", "open_pair", "open_full", "reopen"))
-                        )
-
-                        if close_hit:
-                            return "tag_green_bold"
-                        if open_hit:
-                            return "tag_red_bold"
-                        if related_mod:
-                            return "tag_yellow_bold"
-                        return None
-                    except Exception:
-                        return None
-
-                def _ins_one(sline: str, add_nl: bool = True) -> None:
-                    try:
-                        tag = _pick_tag(sline)
-                        if tag:
-                            self.txt_full.insert("end", sline, tag)
-                        else:
-                            self.txt_full.insert("end", sline)
-                        if add_nl:
-                            self.txt_full.insert("end", "\n")
-                    except Exception:
-                        try:
-                            self.txt_full.insert("end", sline + ("\n" if add_nl else ""))
-                        except Exception:
-                            pass
-
-                if mode == "human":
-                    # human 模式：每个块之间空一行
-                    for bi, blk in enumerate(view_lines or []):
-                        for ln in str(blk).splitlines():
-                            _ins_one(ln, add_nl=True)
-                        if bi != len(view_lines) - 1:
-                            self.txt_full.insert("end", "\n")
-                else:
-                    # 其它模式：逐行插入，便于高亮
-                    for ln in (txt.splitlines() if isinstance(txt, str) else []):
-                        _ins_one(ln, add_nl=True)
-
-                try:
-                    if _manual_hold:
-                        self.txt_full.yview_moveto(_y0)
-                        self.txt_full.xview_moveto(_x0)
-                    else:
-                        self.txt_full.see("end")
-                        try:
-                            _log_clear_manual_scroll()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+            self.var_log_meta.set(data.get('log_meta') or '来源：等待日志...')
         except Exception:
             pass
         # 多空比表格（仅表格，去掉 EXT/VAR/合计总览）
@@ -13765,41 +13675,8 @@ class PanelUI:
             f"bot_dir={paths.get('bot_dir','')} | out_dir={paths.get('out_dir','')} | logs_dir={paths.get('logs_dir','')}\n"
             f"equity={paths.get('equity','')} | positions={paths.get('positions','')} | trades={paths.get('trades','')} | log={paths.get('log','')} | scan_src={scan_src}"
         )
-        # 网格插页刷新（只读，不影响主面板）
-        try:
-            self._render_grid_tab()
-        except Exception as _e:
-            # 重要：不要静默失败，否则你看到的就会一直是“等待数据...”
-            try:
-                if hasattr(self, 'var_grid_status'):
-                    self.var_grid_status.set(f"网格状态：面板渲染异常：{_e}")
-            except Exception:
-                pass
-        try:
-            self._render_grid_book_tab()
-        except Exception as _e:
-            try:
-                if hasattr(self, 'var_grid_book_status'):
-                    self.var_grid_book_status.set(f"网格账本：面板渲染异常：{_e}")
-            except Exception:
-                pass
-        _panel_status_safe = locals().get('panel_status', {}) if isinstance(locals().get('panel_status', {}), dict) else {}
-        try:
-            self._render_trend_observe_tab(_panel_status_safe)
-        except Exception as _e:
-            try:
-                if hasattr(self, 'var_trend_observe_status'):
-                    self.var_trend_observe_status.set(f"趋势观察：面板渲染异常：{_e}")
-            except Exception:
-                pass
-        try:
-            self._render_selection_observe_tab(_panel_status_safe)
-        except Exception as _e:
-            try:
-                if hasattr(self, 'var_selection_observe_status'):
-                    self.var_selection_observe_status.set(f"选币排名：面板渲染异常：{_e}")
-            except Exception:
-                pass
+        # Hidden tabs do not need to reread files or rebuild thousands of rows.
+        self._render_visible_tab(data)
 
         # 小挂件同步
         if self.mini_win and self.mini_win.winfo_exists():
