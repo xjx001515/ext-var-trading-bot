@@ -21,6 +21,7 @@ def main(argv=None):
     settle.add_argument('--state',required=True,choices=sorted(TERMINAL))
     settle.add_argument('--reason',required=True)
     settle.add_argument('--expected',required=True,help='list 输出的完整记录 fingerprint')
+    settle.add_argument('--special-review',action='store_true',help='仅允许 M9/M10 明确结算为 CONFIRMED_NOT_FILLED')
     settle.add_argument('--apply',action='store_true',help='入队；机器人下次完整扫描时核对并结算')
     check=sub.add_parser('status');check.add_argument('id')
     args=parser.parse_args(argv)
@@ -37,7 +38,7 @@ def main(argv=None):
                 for k,r in records.items() if args.all or r.get('state') not in TERMINAL]}
         else:
             command=proposal(args.key,records.get(args.key),state=args.state,reason=args.reason,
-                expected_fingerprint=args.expected,now=time.time())
+                expected_fingerprint=args.expected,now=time.time(),allow_special=bool(args.special_review))
             result={'mode':'QUEUED' if args.apply else 'PREVIEW','command':command,
                 'message':'仅结算状态，不下单、不生成成交、利润或网格层。实际结果以 status 回执为准。'}
             if args.apply:inbox.enqueue(command)

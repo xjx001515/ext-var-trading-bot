@@ -10,23 +10,26 @@ import uuid
 from .legacy_reconciliation import fingerprint, manual_resolution, TERMINAL
 
 
-def validate_manual_record(record):
+def validate_manual_record(record, *, allow_special=False):
     if not isinstance(record, dict) or not record:
         raise ValueError('record_not_found')
     module = str(record.get('module') or '').upper()
-    if record.get('m10_step3_confirmation') or module.startswith(('M9', 'M10')):
+    if (record.get('m10_step3_confirmation') or module.startswith(('M9', 'M10'))) and not allow_special:
         raise ValueError('special_m9_m10_confirmation_requires_its_own_review')
     if record.get('state') in TERMINAL:
         raise ValueError('record_already_settled')
 
 
-def proposal(key, record, *, state, reason, expected_fingerprint, now):
-    validate_manual_record(record)
+def proposal(key, record, *, state, reason, expected_fingerprint, now, allow_special=False):
+    if allow_special and state != 'CONFIRMED_NOT_FILLED':
+        raise ValueError('special_review_only_allows_confirmed_not_filled')
+    validate_manual_record(record, allow_special=allow_special)
     manual_resolution(record, expected_fingerprint=expected_fingerprint,
                       state=state, reason=reason, now=now)
     return {'version':1, 'id':uuid.uuid4().hex, 'record_key':key,
             'expected_fingerprint':expected_fingerprint, 'state':state,
-            'reason':str(reason).strip(), 'created_ts':now}
+            'reason':str(reason).strip(), 'created_ts':now,
+            'special_review': bool(allow_special)}
 
 
 class SettlementInbox:
@@ -97,7 +100,10 @@ class SettlementInbox:
                     result = {'id':ident,'record_key':key,'status':'APPLIED','state':old['state'],
                               'reason':'already_committed_before_restart','ts':now}
                 else:
-                    validate_manual_record(old)
+                    special_review = bool(cmd.get('special_review'))
+                    if special_review and cmd.get('state') != 'CONFIRMED_NOT_FILLED':
+                        raise ValueError('special_review_only_allows_confirmed_not_filled')
+                    validate_manual_record(old, allow_special=special_review)
                     updated, evidence = manual_resolution(old, expected_fingerprint=cmd['expected_fingerprint'],
                         state=cmd['state'], reason=cmd['reason'], now=now)
                     updated['manual_settlement_id'] = ident
