@@ -35,6 +35,7 @@ from bot_core.panel_state import merge_status_snapshot as _merge_panel_status_sn
 from bot_core.browser_runtime import SessionLiveness as _SessionLiveness, ExtRecovery as _ExtRecovery, PageIdentity as _PageIdentity, supported_kwargs as _browser_supported_kwargs, safe_url as _browser_safe_url
 from contextlib import contextmanager
 from bot_core import m10_guard as _m10_guard
+from bot_core import m10_execution as _m10_execution
 from bot_core import postcheck_lifecycle as _postcheck_lifecycle
 from bot_core import close_flow as _close_flow
 from bot_core import margin_guard as _margin_guard
@@ -1597,6 +1598,10 @@ def _runtime_state_set(*, phase: str | None = None, state: str | None = None, ma
         mainloop_state=str(cur.get("mainloop_state") or ""),
     )
     cur.update(norm)
+    if (cur.get('reason_code') == 'user_stopped' and mainloop_state is not None
+            and str(mainloop_state).upper() not in ('STOPPED', 'STOPPING')):
+        cur.pop('reason_code', None)
+        cur.pop('msg', None)
     cur["ts"] = float(time.time())
     if reason_code:
         cur["reason_code"] = str(reason_code or "")[:120]
@@ -15261,6 +15266,52 @@ _LEGACY_ONLY_STATE = {
 _M10_REOPEN_PENDING: Dict[str, Dict[str, Any]] = {}
 _M10_REOPEN_CLEAR_TOMBSTONE: Dict[str, Dict[str, Any]] = {}
 
+
+def _m10_record_recovery_required(coin, platform, side, amount_u, pre, evidence, *, reason):
+    """Persist an uncompleted restore on the REAL close record; do not invent an order."""
+    from bot_core.submission_scope import key
+    _m10_reopen_mark_pending(coin, platform=platform, side=side, amount_u=amount_u,
+        reason=reason, state='recovery_required', pending_kind='recovery_required',
+        blocking=True, owner='verified_close_recovery')
+    with _SYNC_PW_WORKER_LOCK:
+        record = _safety_submission_records().get(key(platform, coin, 'close_all', side))
+        if not record:
+            safe_log(lambda: f'[M10][RECOVERY_REQUIRED] coin={coin} platform={platform} reason=close_journal_missing_no_automatic_restore')
+            return
+        record['m10_recovery'] = {'state': 'recovery_required', 'platform': platform,
+            'coin': coin, 'side': side, 'amount_u': float(amount_u or 0),
+            'pre_position': copy.deepcopy(pre), 'close_evidence': copy.deepcopy(evidence),
+            'ts': float(time.time()), 'reason': str(reason)}
+        if not _safety_submission_save():
+            raise RuntimeError('m10_recovery_record_not_durable')
+
+
+def _m10_recovery_reconcile(coin, rec, snapshot):
+    """Observe a failed restore; never guess a fill or call the removed repair engine."""
+    from bot_core.submission_scope import key
+    platform = str(rec.get('platform') or '').upper()
+    record = _safety_submission_records().get(key(platform, coin, 'close_all', rec.get('side'))) or {}
+    recovery = record.get('m10_recovery') or {}
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    if not recovery or not _snapshot_positions_verified(snap) or float(snap.get('ts') or 0) <= float(recovery.get('ts') or 0):
+        return False, 'recovery_wait_fresh_evidence', rec
+    post = _get_snapshot_coin_leg(snap, coin, platform) or {}
+    pre = recovery.get('pre_position') or {}
+    restored = (post.get('side') == pre.get('side') and float(_position_quantity(pre) or 0) > 0
+                and float(_position_quantity(post) or 0) >= float(_position_quantity(pre)))
+    flat = all(_safety_normalize_position_read(_get_snapshot_coin_leg(snap, coin, plat) or {}).get('state') == 'CONFIRMED_EMPTY'
+               for plat in ('EXT', 'VAR'))
+    if not (restored or flat):
+        return False, 'verified_close_restore_still_required', rec
+    why = 'recovery_quantity_restored' if restored else 'recovery_pair_resolved_flat'
+    with _SYNC_PW_WORKER_LOCK:
+        record['m10_recovery'] = dict(recovery, resolved_ts=float(time.time()), state=why)
+        if not _safety_submission_save():
+            return False, 'recovery_journal_not_durable', rec
+    _m10_reopen_clear(coin, reason=why, healed=restored)
+    return True, why, rec
+
+
 def _m10_step3_track_unconfirmed(platform, coin, side, amount_u, pre_position):
     """Attach M10's original quantity baseline to the existing submission journal."""
     _safety_reserve_submission(platform, coin, side, 'open', pre_position, amount_u,
@@ -15287,6 +15338,14 @@ def _m10_step3_restore_unconfirmed(focus_coin=''):
             continue
         pending = record.get('m10_step3_confirmation') or {}
         coin = str(record.get('coin') or '').upper()
+        recovery = record.get('m10_recovery') or {}
+        if (recovery and not recovery.get('resolved_ts') and coin not in _M10_REOPEN_PENDING
+                and (not focus_coin or coin == str(focus_coin).upper())):
+            _m10_reopen_mark_pending(coin, platform=record.get('platform', ''),
+                side=recovery.get('side', ''), amount_u=recovery.get('amount_u', 0),
+                reason=recovery.get('reason', 'verified_close_restore_required'),
+                state='recovery_required', pending_kind='recovery_required', blocking=True,
+                owner='verified_close_recovery')
         if not isinstance(pending, dict) or not pending or pending.get('resolved_ts') or (focus_coin and coin != str(focus_coin).upper()):
             continue
         if coin in _M10_REOPEN_PENDING:
@@ -15324,8 +15383,19 @@ def _m10_step3_reconcile_unconfirmed(coin, rec, snapshot):
 def _m10_step3_reconcile_scan(snapshot):
     """Reconcile after every accepted scan, including rounds with no trade requests."""
     _m10_step3_restore_unconfirmed()
+    if _snapshot_positions_verified(snapshot):
+        for record in list(_safety_submission_records().values()):
+            if (record.get('module') == 'M10' and _safety_pending_blocks(record)
+                    and str(record.get('kind') or '').startswith('close')
+                    and float(snapshot.get('ts') or 0) > float(record.get('ts') or 0)):
+                platform, coin = record.get('platform'), record.get('coin')
+                post = _get_snapshot_coin_leg(snapshot, coin, platform) or {}
+                if _safety_resolve_submission(platform, coin, post, kind='close'):
+                    safe_log(lambda: f'[M10][CLOSE_CONFIRMED_SCAN] coin={coin} platform={platform} basis=quantity_delta resubmitted=0')
     for coin, rec in list(_M10_REOPEN_PENDING.items()):
-        if rec.get('pending_kind') == 'step3_unconfirmed':
+        if rec.get('pending_kind') == 'recovery_required':
+            _m10_recovery_reconcile(coin, rec, snapshot)
+        elif rec.get('pending_kind') == 'step3_unconfirmed':
             _m10_step3_reconcile_unconfirmed(coin, rec, snapshot)
 
 
@@ -15340,7 +15410,7 @@ def _m10_reopen_pending_is_expired(rec: Dict[str, Any] | None) -> bool:
         r = dict(rec or {})
         if not r:
             return False
-        if r.get('pending_kind') == 'step3_unconfirmed':
+        if r.get('pending_kind') in ('step3_unconfirmed', 'recovery_required'):
             return False  # 180s is a waiting deadline, never evidence of rejection.
         ttl = float(r.get('ttl_sec') or 0.0)
         ts0 = float(r.get('updated_ts') or r.get('ts') or 0.0)
@@ -15359,6 +15429,11 @@ def _m10_reopen_pending_should_block(coin: str, *, platform: str = '', side: str
         cu, rec = '', {}
     if not cu or not rec:
         return False, 'no_pending', {}
+    if rec.get('pending_kind') == 'recovery_required':
+        done, why, _ = _m10_recovery_reconcile(cu, rec, snapshot)
+        if done:
+            return False, why, {}
+        return (False, 'allow_safe_reduce', rec) if _req_is_safe_reduce({'module': mod, 'action_type': action_type}) else (True, why, rec)
     if rec.get('pending_kind') == 'step3_unconfirmed':
         done, why, _ = _m10_step3_reconcile_unconfirmed(cu, rec, snapshot)
         if done:
@@ -15547,7 +15622,7 @@ def _m10_reopen_mark_pending(coin: str, *, platform: str = '', side: str = '', a
             _same_req = bool((str(req_id or '').strip() and str(req_id or '').strip() == str(_tsm.get('req_id') or '').strip()) or (str(trace_id or '').strip() and str(trace_id or '').strip() == str(_tsm.get('trace_id') or '').strip()))
         except Exception:
             _same_leg, _same_amount, _same_req = False, False, False
-        if pending_kind != 'step3_unconfirmed' and _recent_clear and _same_leg and (_same_req or _same_amount):
+        if pending_kind not in ('step3_unconfirmed', 'recovery_required') and _recent_clear and _same_leg and (_same_req or _same_amount):
             try:
                 safe_log(lambda: f"[{now_ts()}] [M10_REOPEN_SKIP_RECLEAR] coin={cu} plat={str(platform or prev.get('platform') or '-').upper()} side={str(side or prev.get('side') or '-').upper()} amount_u={float(amount_u or prev.get('amount_u') or 0.0):.2f} reason={str(reason or '-')} clear_reason={str(_tsm.get('reason') or '-')} req_id={str(req_id or '-') or '-'} trace_id={str(trace_id or '-') or '-'}")
             except Exception as _e:
@@ -15752,6 +15827,8 @@ def _m10_recover_reconcile_no_request(coin: str, *, snapshot: dict | None = None
         rec = dict((_M10_REOPEN_PENDING or {}).get(cu) or {})
         if not cu or not rec:
             return False, 'no_pending', {}
+        if rec.get('pending_kind') == 'recovery_required':
+            return _m10_recovery_reconcile(cu, rec, snapshot)
         if rec.get('pending_kind') == 'step3_unconfirmed':
             return _m10_step3_reconcile_unconfirmed(cu, rec, snapshot)
         if _m10_reopen_pending_is_expired(rec):
@@ -15796,7 +15873,7 @@ def _m10_recover_reconcile_no_request(coin: str, *, snapshot: dict | None = None
                 pass
             try:
                 if float(rec.get('amount_u') or 0.0) > 0.0:
-                    _legacy_deleted_after_failure(snap or {}, cu, str(rec.get('platform') or '').upper().strip(), str(rec.get('side') or '').upper().strip(), float(rec.get('amount_u') or 0.0), 'm10_reopen_missing_after_confirmed_full_close', source_mod='M10')
+                    safe_log(lambda: f"[M10][RECOVERY_REQUIRED] coin={cu} platform={str(rec.get('platform') or '').upper().strip()} side={str(rec.get('side') or '').upper().strip()} amount_u={float(rec.get('amount_u') or 0.0):.2f} reason=m10_reopen_missing_after_confirmed_full_close no_automatic_submit=1")
                     rec['state'] = 'missing_leg_b1'
                     rec['pending_kind'] = 'missing_leg_b1'
                     rec['blocking'] = 1
@@ -30800,6 +30877,11 @@ def _m2_positions_timeout_check(started_ts: float, budget_sec: float, *, scope: 
     except Exception:
         _elapsed = 0.0
     if _elapsed >= _budget:
+        if scope == 'positions_coin':
+            # A completed read can be slow yet valid. The total/platform and
+            # outer worker deadlines still bound the scan; do not kill sessions.
+            safe_log(lambda: f'[M2][POSITION_READ_SLOW] platform={plat} coin={coin} elapsed={_elapsed:.2f}s budget={_budget:.2f}s completed_read=1')
+            return
         _m2_positions_timeout_raise(scope=scope, plat=plat, coin=coin, elapsed_sec=_elapsed, budget_sec=_budget, reason=reason, logfp=logfp)
 
 def _m2_discover_live_position_coins(page: Any, cfg: Dict[str, Any], *, limit: int = 80) -> list[str]:
@@ -31784,10 +31866,16 @@ def _m2_scan_impl(cdp: str, coins: List[str], logfp: str, seed: Optional[int] = 
                     platform_empty_reason_map = {"EXT": "", "VAR": ""}
                     platform_empty_detail_map = {"EXT": {}, "VAR": {}}
                     platform_position_coverage = {"EXT": {}, "VAR": {}}
-                    _positions_total_budget = max(10.0, min(float(_m2_scan_timeout_sec(90.0) or 90.0) * 0.6, 120.0))
+                    # Keep the outer worker deadline as the hard stop; a growing
+                    # coin pool must not turn a normal per-coin read into a
+                    # 2-second timeout. Per-coin reads are observed below, while
+                    # this total budget still fail-closes the scan as a whole.
+                    _positions_total_budget = max(30.0, min(float(_m2_scan_timeout_sec(90.0) or 90.0) * 0.9, 120.0))
                     _positions_started_ts = float(time.time())
-                    _plat_budget = min(_m2_positions_platform_timeout_sec(), max(5.0, _positions_total_budget / 2.0))
-                    _coin_budget = min(_m2_positions_coin_timeout_sec(), max(2.0, _plat_budget / max(1, len(coins or []))))
+                    _coin_budget = _m2_positions_coin_timeout_sec()
+                    _plat_budget = min(_positions_total_budget, max(_m2_positions_platform_timeout_sec(),
+                        _coin_budget * max(1, len(coins or []))))
+                    safe_log(lambda: f'[M2][POSITION_BUDGET] coins={len(coins or [])} coin_sec={_coin_budget:.2f} platform_sec={_plat_budget:.2f} total_sec={_positions_total_budget:.2f}')
                     for plat, page, cfg in [("EXT", ext_page, EXT), ("VAR", var_page, VAR)]:
                         _m2_abort_if_runtime_stale(f'm2_scan.positions.{plat}.begin', runtime_gen=_scan_runtime_gen, plat=plat, logfp=logfp, reason=str(reason or ''))
                         _m2_positions_timeout_check(_positions_started_ts, _positions_total_budget, scope='positions_total', plat=plat, coin='', reason=str(reason or ''), logfp=logfp)
@@ -33348,14 +33436,14 @@ def _scan_runtime_panel_brief(scan_watch: dict | None, last_round: dict | None, 
     except Exception:
         hb_ts = 0.0
     hb_age_sec = (float(nowv) - hb_ts) if hb_ts > 0 else None
-    if sw_state == "RECOVERING_UI":
+    if scan_busy and sw_state == "RECOVERING_UI":
         display_state = "上一轮扫描已超时，正在恢复"
         wake_text = "扫描恢复中"
         color = "红色"
         severity = "critical"
         state_note = "当前不是正常等待，也不是新一轮未启动；是上一轮扫描已被终止，正在做恢复。"
         one_line = msg or reason_text or "上一轮扫描已超时，系统正在恢复，恢复完才会进入下一轮。"
-    elif sw_state == "SCAN_STUCK":
+    elif scan_busy and sw_state == "SCAN_STUCK":
         display_state = "本轮扫描卡住，正在强制恢复"
         wake_text = "扫描卡住"
         color = "红色"
@@ -33947,7 +34035,7 @@ def _m2_scan_watch_update(stage: str, pct: int, msg: str = "", *, reason: str = 
         except Exception:
             _rid = "m2"
     obj.update({
-        "active": str(state or "").upper().strip() not in ("IDLE", "DONE"),
+        "active": str(state or "").upper().strip() not in ("IDLE", "DONE", "ERROR", "ROUND_ERROR", "CANCELLED"),
         "state": str(state or "SCANNING"),
         "stage": str(stage or "").strip() or "unknown",
         "pct": int(pct or 0),
@@ -34033,6 +34121,7 @@ def _m2_make_fail_snapshot(reason: str, *, note: str = "", started_ts: float | N
     - 仍然返回一个结构化 snapshot，避免上层整链断裂
     - 尽可能带上 LAST_GOOD_EQUITY（上次成功权益）作为兜底，供 Adapter 写入 equity.json / equity_live.json 做“过期显示”
     """
+    _m2_scan_watch_finish('ERROR', reason=str(reason or 'scan_failed'), touch_panel=False)
     _ts = float(time.time())
     _lgs = {}
     try:
@@ -35132,6 +35221,16 @@ def _round_watch_finish(state: str = "DONE", *, msg: str = "", reason: str = "",
         rw["heartbeat_ts"] = nowv
         rw["runtime_state_source"] = "round_watch_diag_only"
         globals()["_MAIN_ROUND_WATCH"] = rw
+        _inflight = dict(globals().get('_SYNC_PW_WORKER_INFLIGHT') or {})
+        if not any(str(v.get('mod') or '').upper() == 'M2' for v in _inflight.values()):
+            _sw = dict(globals().get('_M2_SCAN_WATCH') or {})
+            if _sw:
+                _sw['active'] = False
+                if str(_sw.get('state') or '').upper() in ('SCAN_STUCK', 'RECOVERING_UI', 'SCANNING'):
+                    _sw.update(state='ERROR', msg='上轮扫描失败，等待下一次扫描', ended_ts=nowv)
+                globals()['_M2_SCAN_WATCH'] = _sw
+        if not any(str(v.get('mod') or '').upper().startswith('EXEC') for v in _inflight.values()):
+            _exec_batch_watch_finish('IDLE', msg='本轮执行结束', reason='round_finished')
         try:
             _finish_state = str(state or 'DONE').upper().strip()
             _runtime_state_set(
@@ -35705,6 +35804,11 @@ def m2_scan(cdp: str, coins: List[str], logfp: str, seed: Optional[int] = None, 
         except TimeoutError as _te:
             _reason = str(_te or f"m2_scan_timeout:{_timeout_sec:.1f}s")
             _last_retryable_reason = _reason
+            if _reason.startswith('m2_positions_scan_timeout:'):
+                # The worker raised and returned normally: a budget expiry is
+                # not proof of a dead browser and must not reset the executor.
+                safe_log(lambda: f'[M2][SCAN_BUDGET_EXHAUSTED] reason={_reason} runtime_reset=0 wait_next_scan=1')
+                return _m2_make_fail_snapshot(_reason, note='positions_budget_exhausted', started_ts=_started_ts)
             try:
                 _m2_scan_watch_update("timeout", int((_m2_scan_watch_snapshot() or {}).get("pct") or 5), "M2 扫描超时，准备重建并重试", reason=_reason, state="SCAN_STUCK", extra={"timeout_sec": float(_timeout_sec), "retry_attempt": int(_attempt + 1)}, touch_panel=True)
             except Exception as _e:
@@ -76609,6 +76713,10 @@ def _exec_resolve_submit_usd(order: Any) -> tuple[float, str]:
         usd_raw = 0.0
     if usd_raw <= 0.0:
         return 0.0, 'bad_order_usd'
+    rollback_cap = (getattr(order, 'meta', None) or {}).get('m10_rollback_max_u')
+    if rollback_cap is not None:
+        usd_final = float(int(min(usd_raw, float(rollback_cap)) // 10) * 10)
+        return (usd_final, 'm10_rollback_verified_cap') if usd_final >= 40.0 else (0.0, 'm10_rollback_below_min_no_raise')
     if _order_should_keep_exact_reduce_usd(order):
         try:
             usd_final = float(int(float(usd_raw) // 10) * 10)
@@ -97754,9 +97862,16 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     min_qty=_M10_GUARD_STORE.min_qty(_pc_loss, coin0, os.environ.get('M10_MIN_QTY_OVERRIDES', '')),
                                     failed_u=_M10_GUARD_STORE.failed_u(_pc_loss, coin0))
                                 _m10_pre_det['loss_plat'] = _pc_loss
+                                # Any outstanding leg order must settle before dismantling a hedge.
+                                for _pc_platform in ('EXT', 'VAR'):
+                                    _pc_pending = _safety_pending_scope(_pc_platform, coin0)
+                                    if _pc_pending:
+                                        _m10_pre_ok, _m10_pre_reason = False, 'existing_leg_order_unconfirmed'
+                                        _m10_pre_det['blocker'] = _submission_blocker_detail(_pc_pending)
+                                        break
                             except Exception as _e:
                                 _record_swallowed_exception('m10_step2_precheck', _e)
-                                _m10_pre_ok, _m10_pre_reason, _m10_pre_det = True, 'precheck_exc_fail_open', {}
+                                _m10_pre_ok, _m10_pre_reason, _m10_pre_det = False, 'precheck_unavailable_no_submit', {'error': repr(_e)}
                         if not ((pre_ext_u > 0.0 and pre_var_u < 0.0) or (pre_var_u > 0.0 and pre_ext_u < 0.0)):
                             ok = False
                             reason = f"tp_skip_not_win_loss pre_ext_u={pre_ext_u:.2f} pre_var_u={pre_var_u:.2f}"
@@ -97778,14 +97893,41 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
 
                             def _probe_read_leg(plat: str):
                                 try:
-                                    if plat == "EXT":
-                                        row = read_coin_row_basic(ext_page, EXT, coin0)
-                                    else:
-                                        row = read_coin_row_basic(var_page, VAR, coin0)
-                                    return row or {}
+                                    exe = ext_exe if plat == 'EXT' else var_exe
+                                    page = getattr(exe, 'page', None) or (ext_page if plat == 'EXT' else var_page)
+                                    row = _exec_read_position_truth(page, EXT if plat == 'EXT' else VAR, coin0)
+                                    if row.get('position_state') == 'UNAVAILABLE' and plat == 'VAR':
+                                        flow = _close_flow.current() or _close_flow.CloseFlow(assert_live=_WORKER_STATE.assert_live)
+                                        if _full_close_confirm_var_absence(exe, coin0, flow):
+                                            return {'position_state': 'CONFIRMED_EMPTY', 'side': 'NONE',
+                                                    'qty_abs': 0.0, 'notional_u': 0.0, 'confirmed_empty': True}
+                                    if row.get('position_state') == 'UNAVAILABLE' and plat == 'EXT':
+                                        samples = []
+                                        for _sample in range(2):
+                                            pf = _exec_read_portfolio_snapshot(page, EXT, stop_when_found=False)
+                                            positions = pf.get('positions') or {}
+                                            complete = bool(pf.get('available') and not pf.get('error')
+                                                and (pf.get('position_state') == 'CONFIRMED_EMPTY' or
+                                                     (int(pf.get('visible_rows') or 0) > 0 and len(positions) == int(pf['visible_rows']))))
+                                            if not complete or coin0 in positions:
+                                                break
+                                            samples.append(sorted(positions))
+                                            if _sample == 0:
+                                                _pw_wait_ms(page, 250, 'm10.ext_absence_sample')
+                                        if len(samples) == 2 and samples[0] == samples[1]:
+                                            row = {'position_state': 'CONFIRMED_EMPTY', 'side': 'NONE', 'qty_abs': 0.0,
+                                                   'notional_u': 0.0, 'confirmed_empty': True, 'reason': 'two_complete_ext_tables_coin_absent'}
+                                            _safety_resolve_submission(plat, coin0, row)
+                                    return row
                                 except Exception as e:
-                                    _tp_log("probe_read_leg_exc（探针读腿异常）", plat=plat, err=repr(e))
-                                    return {}
+                                    _tp_log('probe_read_leg_unavailable', plat=plat, err=repr(e))
+                                    return {'position_state': 'UNAVAILABLE', 'reason': 'm10_read_failed'}
+
+                            def _m10_attempts_since(offset):
+                                return copy.deepcopy((_req_ensure_meta(req).get('_submission_attempts') or [])[offset:])
+
+                            def _m10_attempt_count():
+                                return len(_req_ensure_meta(req).get('_submission_attempts') or [])
 
                             try:
                                 snap_ts = int(float((snapshot or {}).get('ts') or time.time()))
@@ -97834,6 +97976,9 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     parent_req = req.to_dict() if hasattr(req, 'to_dict') else {}
                                 meta_parent = dict((parent_req.get('meta') if isinstance(parent_req.get('meta'), dict) else {}) or {})
                                 meta_child = dict(meta_parent)
+                                for _mk in ('_submit_verified_ok', '_submit_verified_ev', '_submission_attempts'):
+                                    meta_child.pop(_mk, None)
+                                meta_child['_submission_attempts'] = copy.deepcopy((detail or {}).get('submission_attempts') or [])
                                 _parent_req_id = str(meta_parent.get('req_id') or parent_req.get('req_id') or '')
                                 _parent_trace_id = str(meta_parent.get('trace_id') or parent_req.get('trace_id') or '')
                                 _step_suffix = f"step{int(step_no)}:{str(step_platform or '').upper()}:{str(step_action or '').lower()}:{str(step_side or '').upper()}"
@@ -97869,7 +98014,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     'meta': meta_child,
                                 }
                                 rr = _make_exec_result_row(child_req, ok=bool(step_ok), skipped=False, reason=str(step_reason or ''), t_sec=(round(max(0.0, time.time() - float(step_t0)), 3) if step_t0 else None), exec_u=(float(amount_u) if amount_u is not None else None), exec_px=step_exec_px, detail=(detail if isinstance(detail, dict) else {'detail': detail} if detail is not None else {'m10_step_no': int(step_no)}))
-                                if int(step_no) == 3 and isinstance(detail, dict):
+                                if isinstance(detail, dict) and detail.get('state'):
                                     if detail.get('state') == 'pending':
                                         rr = _safety_apply_confirmation_fields(dict(rr, ok=False, submit_ok=True,
                                             pending=True, pending_confirm=True, confirmed_fail=False,
@@ -97877,6 +98022,9 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     elif detail.get('state') == 'confirmed':
                                         rr = _safety_apply_confirmation_fields(dict(rr, ok=True,
                                             confirmed_fail=False, postcheck_ok=True))
+                                    elif detail.get('state') == 'failed':
+                                        rr = _safety_apply_confirmation_fields(dict(rr, ok=False,
+                                            confirmed_fail=True, pending=False, pending_confirm=False, postcheck_ok=False))
                                 rr['child_step'] = True
                                 rr['step_no'] = int(step_no)
                                 rr['step_id'] = str(step_id or '')
@@ -97896,123 +98044,70 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     _record_swallowed_exception('except_pass_line_1567', _e)
                                     pass
                             _step1_t0 = time.time()
-                            exe_win = ext_exe if win_plat == "EXT" else var_exe
-                            page_win = ext_page if win_plat == "EXT" else var_page
-                            ok1 = False
-                            _ok1_path = "none"
-                            _pre_win_notional = float(pre_var_n if win_plat == 'VAR' else pre_ext_n)
-
-                            def _m10_step1_probe_closed() -> tuple[bool, dict]:
-                                try:
-                                    _row = _probe_read_leg(win_plat) or {}
-                                except Exception as _e:
-                                    _tp_log("step1_probe_exc（步骤1探针异常）", plat=win_plat, err=repr(_e))
-                                    _row = {}
-                                _notional_now = float(_row.get('notional_u') or _row.get('value_usd') or 0.0)
-                                _side_now = str(_row.get('side') or '').upper().strip()
-                                _expect_side = str((pre_ext if win_plat=='EXT' else pre_var).get('side') or '').upper().strip()
-                                _pre_n = max(0.0, float(_pre_win_notional or 0.0))
-                                try:
-                                    _partial_thr = float(cfg_getf_runtime('M10_STEP1_PARTIAL_OK_RATIO', 0.90) or 0.90)
-                                except Exception:
-                                    _partial_thr = 0.90
-                                _partial_thr = max(0.50, min(_partial_thr, 0.99))
-                                _full_flat_thr_u = max(10.0, _pre_n * 0.01)
-                                _filled_ratio = 1.0 if _pre_n <= 1e-9 else max(0.0, min((_pre_n - max(0.0, _notional_now)) / _pre_n, 1.0))
-                                _full_success = (not bool(_row.get('has_position'))) or (_notional_now <= _full_flat_thr_u)
-                                _partial_success = bool(_filled_ratio >= _partial_thr)
-                                _reversed = bool(_expect_side and _side_now and _side_now != _expect_side)
-                                _mode = 'full_success' if _full_success else ('partial_success' if _partial_success else ('reversed' if _reversed else 'fail'))
-                                _effective_ratio = (1.0 if (_full_success or _reversed) else float(_filled_ratio))
-                                return bool(_full_success or _partial_success or _reversed), {
-                                    'has_position': bool(_row.get('has_position')),
-                                    'side': _side_now,
-                                    'notional_u': _notional_now,
-                                    'expect_side': _expect_side,
-                                    'full_success': bool(_full_success),
-                                    'partial_success': bool(_partial_success),
-                                    'reversed': bool(_reversed),
-                                    'filled_ratio': float(_filled_ratio),
-                                    'filled_ratio_effective': float(max(0.0, min(_effective_ratio, 1.0))),
-                                    'partial_ok_ratio': float(_partial_thr),
-                                    'full_flat_thr_u': float(_full_flat_thr_u),
-                                    'mode': str(_mode),
-                                }
-
-                            def _m10_step1_try_close() -> tuple[bool, str]:
-                                _path = "exe_none"
-                                _ok = False
-                                try:
-                                    if exe_win is None:
-                                        return False, _path
-                                    if hasattr(exe_win, 'close_all'):
-                                        _ok = bool(exe_win.close_all(coin0, dry_run=False))
-                                        _path = "close_all"
-                                    if (not _ok) and hasattr(exe_win, 'close_position_pct'):
-                                        _ok = bool(exe_win.close_position_pct(coin0, pct=100.0, dry_run=False))
-                                        _path = "close_position_pct_100"
-                                except Exception as e:
-                                    _ok = False
-                                    _tp_log("step1_close_exc（步骤1全平异常）", plat=win_plat, err=repr(e), path=_path)
-                                return bool(_ok), str(_path or 'none')
-
-                            ok1, _ok1_path = _m10_step1_try_close()
-                            _step1_probe_detail = {}
+                            exe_win = ext_exe if win_plat == 'EXT' else var_exe
+                            page_win = getattr(exe_win, 'page', None)
+                            _step1_pre = copy.deepcopy(_probe_read_leg(win_plat))
+                            _pre_win_notional = float(_step1_pre.get('notional_u') or 0.0)
+                            _step1_start = _m10_attempt_count()
                             _step1_clear_rep = {}
-                            if not ok1 and page_win is not None:
-                                try:
-                                    if win_plat == 'EXT':
-                                        _goto_ok1 = bool(_exec_goto_coin_ext(page_win, coin0, timeout_ms=2600, exec_privilege=True, privilege_reason="m10_step1_retry"))
-                                    else:
-                                        _goto_ok1 = bool(_exec_goto_coin_var(page_win, coin0, timeout_ms=2600, allow_goto=True, ctx='M10_STEP1_RETRY', exec_privilege=True, privilege_reason='m10_step1_retry'))
-                                    try:
-                                        _pw_wait_ms(page_win, 180, f'm10.step1.retry_wait:{coin0}')
-                                    except Exception as _e:
-                                        _record_swallowed_exception('except_pass_line_1567a', _e)
-                                        pass
-                                    _retry_ok, _retry_path = _m10_step1_try_close()
-                                    ok1 = bool(_retry_ok)
-                                    _ok1_path = f"retry_goto:{int(1 if _goto_ok1 else 0)}>{_retry_path}"
-                                except Exception as e:
-                                    _tp_log("step1_retry_exc（步骤1重试异常）", plat=win_plat, err=repr(e))
-                            try:
-                                _probe_ok1, _step1_probe_detail = _m10_step1_probe_closed()
-                                if _probe_ok1:
-                                    ok1 = True
-                                    _ok1_path = f"{_ok1_path}+probe_confirm"
-                            except Exception as _e:
-                                _record_swallowed_exception('except_pass_line_1567b', _e)
-                                pass
-                            try:
-                                safe_log(lambda: f"[M10][STEP1] coin={coin0} win_plat={win_plat} ok={bool(ok1)} path={_ok1_path} probe={json.dumps(_step1_probe_detail, ensure_ascii=False)}")
-                            except Exception as _e:
-                                _log_exc(mod="SYS", stage="EXC_PASS", e=_e)
+                            _step1_probe_detail = {}
+                            _step1_state, _ok1_path, ok1 = 'failed', 'not_submitted', False
+                            _step1_flow = _close_flow.CloseFlow(deadline=time.monotonic() + 40.0,
+                                assert_live=_WORKER_STATE.assert_live)
 
-                            if not ok1:
-                                try:
-                                    ok1, msg1 = _close_full_via_partial_one_shared(
-                                        win_plat,
-                                        (ext_exe if win_plat == 'EXT' else var_exe),
-                                        (ext_page if win_plat == 'EXT' else var_page),
-                                        coin0,
-                                        snapshot,
-                                        _a1_norm_side((pre_ext if win_plat=='EXT' else pre_var).get('side') or ''),
-                                        target_close_ratio=0.90,
-                                    )
-                                    ok1 = bool(ok1)
-                                    if ok1:
+                            def _m10_step1_probe_closed():
+                                row = _probe_read_leg(win_plat)
+                                confirmed, detail = _m10_execution.close_progress(_step1_pre, row,
+                                    cfg_getf_runtime('M10_STEP1_PARTIAL_OK_RATIO', 0.90) or 0.90)
+                                detail['post_position'] = row
+                                return confirmed, detail
+
+                            _step1_pre_valid = (_step1_pre.get('position_state') == 'FOUND'
+                                and float(_position_quantity(_step1_pre) or 0.0) > 0.0
+                                and _a1_norm_side(_step1_pre.get('side')) == _a1_norm_side((pre_ext if win_plat == 'EXT' else pre_var).get('side')))
+                            if _step1_pre_valid:
+                                with _close_flow.scope(_step1_flow):
+                                    _step1_flow.begin(win_plat, coin0)
+                                    for _close_try in range(2):
+                                        _reported_close = False
                                         try:
-                                            _probe_ok1, _step1_probe_detail = _m10_step1_probe_closed()
-                                            ok1 = bool(_probe_ok1)
-                                            _ok1_path = f"fallback_partial>{'probe_confirm' if ok1 else 'probe_fail'}"
-                                        except Exception as _e:
-                                            _record_swallowed_exception('except_pass_line_1567c', _e)
-                                            _ok1_path = "fallback_partial"
-                                    if not ok1:
-                                        _tp_log("step1_fallback_partial_fail（步骤1兜底部分平失败）", plat=win_plat, msg=str(msg1))
-                                except Exception as e:
-                                    ok1 = False
-                                    _tp_log("step1_fallback_partial_exc（步骤1兜底异常）", plat=win_plat, err=repr(e))
+                                            _step1_flow.check()
+                                            if _safety_pending_scope(win_plat, coin0, 'close_all'):
+                                                _step1_state = 'pending'
+                                                break
+                                            if hasattr(exe_win, 'close_all'):
+                                                _ok1_path = 'close_all'
+                                                _reported_close = bool(exe_win.close_all(coin0, dry_run=False))
+                                            elif hasattr(exe_win, 'close_position_pct'):
+                                                _ok1_path = 'close_position_pct_100'
+                                                _reported_close = bool(exe_win.close_position_pct(coin0, pct=100.0, dry_run=False))
+                                        except Exception as e:
+                                            _tp_log('step1_close_exc', plat=win_plat, err=repr(e), attempt=_close_try + 1)
+                                        _probe_ok1, _step1_probe_detail = _m10_step1_probe_closed()
+                                        # An incompletely settled close may still fill. Never open through it.
+                                        _close_pending = _safety_pending_scope(win_plat, coin0, 'close_all')
+                                        ok1 = bool(_probe_ok1 and not _close_pending)
+                                        _step1_state = _m10_execution.outcome(_m10_attempts_since(_step1_start),
+                                            confirmed=ok1, delta_qty=_step1_probe_detail.get('closed_qty'), reported=_reported_close)
+                                        if _close_pending:
+                                            _step1_state = 'pending'
+                                        if _step1_state != 'failed' or _close_try == 1:
+                                            break
+                                        # One recovery only, and only after proof that no submit was dispatched.
+                                        try:
+                                            _step1_flow.check()
+                                            if win_plat == 'VAR' and not _full_close_dismiss_dialog(exe_win.page, coin0, _step1_flow):
+                                                break
+                                            if not _step1_flow.recover_once(win_plat, coin0,
+                                                    lambda: _full_close_recover_page(exe_win, win_plat, coin0, _step1_flow)):
+                                                break
+                                        except Exception as e:
+                                            _tp_log('step1_no_submit_recovery_failed', plat=win_plat, err=repr(e))
+                                            break
+                            else:
+                                _step1_probe_detail = {'reason': 'step1_pre_position_unavailable_or_changed', 'pre_position': _step1_pre}
+                            _step1_probe_detail.update(state=_step1_state, submission_attempts=_m10_attempts_since(_step1_start))
+                            safe_log(lambda: f"[M10][STEP1] coin={coin0} win_plat={win_plat} ok={ok1} state={_step1_state} probe={json.dumps(_step1_probe_detail, ensure_ascii=False)}")
 
                             if not ok1:
                                 try:
@@ -98021,12 +98116,12 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                         if int(_st.get('step') or 0) == 1 or str(_st.get('action') or '').lower() in ('close_full','close_all','close'):
                                             _step1_id = str(_st.get('step_id') or '')
                                             break
-                                    _m10_emit_step_row(1, 'close_full', win_plat, str((pre_ext if win_plat=='EXT' else pre_var).get('side') or ''), float(pre_var_n if win_plat=='VAR' else pre_ext_n), False, 'tp_step1_close_win_fail', step_id=_step1_id, detail={'path': _ok1_path, 'probe': dict(_step1_probe_detail or {}), 'did_clear_grid': bool((_step1_clear_rep or {}).get('grid_changed') or 0)}, step_t0=_step1_t0)
+                                    _m10_emit_step_row(1, 'close_full', win_plat, str((pre_ext if win_plat=='EXT' else pre_var).get('side') or ''), float(pre_var_n if win_plat=='VAR' else pre_ext_n), False, ('step1_unconfirmed' if _step1_state == 'pending' else 'tp_step1_close_win_fail'), step_id=_step1_id, detail={'state': _step1_state, 'submission_attempts': _m10_attempts_since(_step1_start), 'path': _ok1_path, 'probe': dict(_step1_probe_detail or {}), 'did_clear_grid': False}, step_t0=_step1_t0)
                                 except Exception as _e:
                                     _record_swallowed_exception('except_pass_line_1568', _e)
                                     pass
                                 ok = False
-                                reason = "tp_step1_close_win_fail"
+                                reason = "tp_koujing_fail:step1=False step2=False step3=False step1=unconfirmed" if _step1_state == "pending" else "tp_step1_close_win_fail"
                                 try:
                                     _m10_finish_profile(False, reason)
                                 except Exception as _e:
@@ -98034,7 +98129,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     pass
                             else:
                                 _step1_mode = str((_step1_probe_detail or {}).get('mode') or 'full_success')
-                                _step1_fill_ratio = float((_step1_probe_detail or {}).get('filled_ratio_effective') or (1.0 if ok1 else 0.0) or 0.0)
+                                _step1_fill_ratio = float((_step1_probe_detail or {}).get('filled_ratio_effective') or 0.0)
                                 _released_profit_u = max(0.0, float(win_upnl_pre or 0.0) * max(0.0, min(_step1_fill_ratio, 1.0)))
                                 _tp_log("step1_close_win_ok（步骤1全平盈利腿成功）", plat=win_plat, win_upnl_pre=win_upnl_pre, tx_id=tx_id, mode=_step1_mode, filled_ratio=_step1_fill_ratio, released_profit_u=_released_profit_u)
                                 _step1_clear_rep = {}
@@ -98051,7 +98146,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                         if int(_st.get('step') or 0) == 1 or str(_st.get('action') or '').lower() in ('close_full','close_all','close'):
                                             _step1_id = str(_st.get('step_id') or '')
                                             break
-                                    _m10_emit_step_row(1, 'close_full', win_plat, str((pre_ext if win_plat=='EXT' else pre_var).get('side') or ''), float(pre_var_n if win_plat=='VAR' else pre_ext_n), True, ('step1_close_win_ok' if _step1_mode == 'full_success' else 'step1_close_win_partial_ok'), step_id=_step1_id, detail={'path': _ok1_path, 'tx_id': tx_id, 'win_upnl_pre': float(win_upnl_pre), 'released_profit_u': float(_released_profit_u), 'filled_ratio': float(_step1_fill_ratio), 'step1_mode': str(_step1_mode), 'probe': dict(_step1_probe_detail or {}), 'did_clear_grid': bool((_step1_clear_rep or {}).get('grid_changed') or 0)}, step_t0=_step1_t0)
+                                    _m10_emit_step_row(1, 'close_full', win_plat, str((pre_ext if win_plat=='EXT' else pre_var).get('side') or ''), float(pre_var_n if win_plat=='VAR' else pre_ext_n), True, ('step1_close_win_ok' if _step1_mode == 'full_success' else 'step1_close_win_partial_ok'), step_id=_step1_id, detail={'state': 'confirmed', 'submission_attempts': _m10_attempts_since(_step1_start), 'path': _ok1_path, 'tx_id': tx_id, 'win_upnl_pre': float(win_upnl_pre), 'released_profit_u': float(_released_profit_u), 'filled_ratio': float(_step1_fill_ratio), 'step1_mode': str(_step1_mode), 'probe': dict(_step1_probe_detail or {}), 'did_clear_grid': bool((_step1_clear_rep or {}).get('grid_changed') or 0)}, step_t0=_step1_t0)
                                 except Exception as _e:
                                     _record_swallowed_exception('except_pass_line_1569', _e)
                                     pass
@@ -98070,10 +98165,15 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     _record_swallowed_exception('except_pass_line_1570', _e)
                                     pass
                                 loss_row = _loss_row_box.get('row') or _probe_read_leg(loss_plat)
+                                _step2_read_ok = loss_row.get('position_state') in ('FOUND', 'CONFIRMED_EMPTY')
+                                if not _step2_read_ok:
+                                    loss_row = dict(pre_var if loss_plat == 'VAR' else pre_ext)
+                                _step2_start = _m10_attempt_count()
+                                _step2_state, _step2_confirm = 'failed', {}
                                 loss_upnl_now = float(loss_row.get('upnl_u') or 0.0)
                                 loss_notional_now = float(loss_row.get('notional_u') or loss_row.get('value_usd') or 0.0)
 
-                                if loss_notional_now <= 0.0:
+                                if _step2_read_ok and loss_notional_now <= 0.0:
                                     ok = True
                                     reason = "tp_step2_skip_no_loss_pos"
                                     _tp_log("step2_skip_no_loss_pos（步骤2跳过：亏损腿无仓）", plat=loss_plat)
@@ -98092,7 +98192,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     except Exception as _e:
                                         _record_swallowed_exception('except_pass_line_1571a', _e)
                                         pass
-                                elif loss_upnl_now >= 0.0:
+                                elif _step2_read_ok and loss_upnl_now >= 0.0:
                                     ok = True
                                     reason = f"tp_step2_skip_not_loss_anymore upnl_now={loss_upnl_now:.2f}"
                                     _tp_log("step2_skip_not_loss_anymore（步骤2跳过：已非亏损腿）", plat=loss_plat, upnl_now=loss_upnl_now)
@@ -98112,7 +98212,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                         _record_swallowed_exception('except_pass_line_1572a', _e)
                                         pass
                                 else:
-                                    _step1_fill_ratio = float((_step1_probe_detail or {}).get('filled_ratio_effective') or 1.0)
+                                    _step1_fill_ratio = float((_step1_probe_detail or {}).get('filled_ratio_effective') or 0.0)
                                     _released_profit_u = max(0.0, float(win_upnl_pre or 0.0) * max(0.0, min(_step1_fill_ratio, 1.0)))
                                     target_loss_u = max(0.0, float(_released_profit_u) * float(M10_STEP2_BUDGET_RATIO))
                                     loss_abs_u = max(1e-9, abs(float(loss_upnl_now)))
@@ -98137,7 +98237,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                         calc_reason=str((_step2_calc or {}).get('reason') or ''),
                                     )
 
-                                    if close_u < 10.0:
+                                    if close_u < 10.0 or not _step2_read_ok:
                                         ok2 = False
                                         _tp_log("step2_wait_floor_too_small（步骤2等待：向下取整十后不足执行金额）", plat=loss_plat, target_loss_u=target_loss_u, ratio=ratio, loss_notional_now=loss_notional_now, close_u=close_u, calc_reason=str((_step2_calc or {}).get('reason') or ''))
                                         try:
@@ -98163,6 +98263,12 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                         except Exception as e:
                                             ok2 = False
                                             _tp_log("step2_exec_exc（步骤2执行异常）", plat=loss_plat, err=repr(e))
+                                        _step2_post = _probe_read_leg(loss_plat)
+                                        _step2_reported = bool(ok2)
+                                        ok2, _step2_confirm = _safety_verify_position_change(kind='close',
+                                            side=loss_side_ls, usd=close_u, pre=loss_row, post=_step2_post)
+                                        _step2_state = _m10_execution.outcome(_m10_attempts_since(_step2_start),
+                                            confirmed=ok2, delta_qty=_step2_confirm.get('actual_delta_qty'), reported=_step2_reported)
                                         try:
                                             safe_log(lambda: f"[M10][STEP2] coin={coin0} loss_plat={loss_plat} ok={bool(ok2)} close_u={float(close_u):.4f} opp={opp}")
                                         except Exception as _e:
@@ -98173,7 +98279,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                                 if int(_st.get('step') or 0) == 2 or str(_st.get('action') or '').lower() in ('close_partial_notional','close_partial','decrease','reduce'):
                                                     _step2_id = str(_st.get('step_id') or '')
                                                     break
-                                            _m10_emit_step_row(2, 'close_partial_notional', loss_plat, str(loss_side_ls or ''), float(close_u), bool(ok2), ('step2_reduce_ok' if ok2 else 'tp_step2_loss_reduce_fail'), step_id=_step2_id, detail={'opp': opp, 'ratio': float(ratio), 'target_loss_u': float(target_loss_u), 'loss_upnl_now': float(loss_upnl_now), 'loss_notional_now': float(loss_notional_now), 'released_profit_u': float(_released_profit_u), 'step1_filled_ratio': float(_step1_fill_ratio), 'step2_budget_ratio': float(M10_STEP2_BUDGET_RATIO), 'step2_calc': dict(_step2_calc or {})}, step_t0=_step2_t0)
+                                            _m10_emit_step_row(2, 'close_partial_notional', loss_plat, str(loss_side_ls or ''), float(close_u), bool(ok2), ('step2_reduce_ok' if ok2 else 'step2_unconfirmed' if _step2_state == 'pending' else 'tp_step2_loss_reduce_fail'), step_id=_step2_id, detail={'state': _step2_state, 'confirm': _step2_confirm, 'submission_attempts': _m10_attempts_since(_step2_start), 'opp': opp, 'ratio': float(ratio), 'target_loss_u': float(target_loss_u), 'loss_upnl_now': float(loss_upnl_now), 'loss_notional_now': float(loss_notional_now), 'released_profit_u': float(_released_profit_u), 'step1_filled_ratio': float(_step1_fill_ratio), 'step2_budget_ratio': float(M10_STEP2_BUDGET_RATIO), 'step2_calc': dict(_step2_calc or {})}, step_t0=_step2_t0)
                                         except Exception as _e:
                                             _record_swallowed_exception('except_pass_line_1574', _e)
                                             pass
@@ -98225,48 +98331,68 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                     step3_detail = {'reopen_u': float(step3_u), 'side': str(step3_side or ''), 'loss_remain_u_real': float(step3_loss_remain_u_real), 'loss_remain_source': str(step3_loss_remain_source or ''), 'loss_probe': dict(step3_loss_probe or {}), 'rule': 'reopen_loss_leg_70pct_u10'}
                                     _m10_rb_mode = False
                                     _m10_step3_state = 'failed'
-                                    if ok1 and not ok2:
-                                        if close_u >= 10.0:
+                                    if ok1 and not ok2 and _step2_state == 'pending':
+                                        # The reduce order was dispatched but its fill is unknown.
+                                        # Do not retry it and do not reopen the winning leg while
+                                        # the reduce result can still arrive later.
+                                        step3_u = 0.0
+                                        step3_side = ''
+                                        _m10_rb_mode = False
+                                        step3_detail.update({'state': 'step2_unconfirmed',
+                                            'rollback_block_reason': 'step2_submit_unconfirmed_no_retry',
+                                            'reopen_u': 0.0})
+                                        safe_log(lambda: f"[M10][STEP2_UNCONFIRMED_NO_ROLLBACK] coin={coin0} loss_plat={loss_plat} close_u={float(close_u):.4f} step3=0 submit_retry=0")
+                                    elif ok1 and not ok2:
+                                            if close_u >= 10.0 and _step2_state == 'failed':
+                                                try:
+                                                    _M10_GUARD_STORE.note_failed(loss_plat, coin0, close_u)
+                                                except Exception as _e:
+                                                    _record_swallowed_exception('m10_step2_note_failed', _e)
                                             try:
-                                                _M10_GUARD_STORE.note_failed(loss_plat, coin0, close_u)
+                                                _m10_loss_page = ext_page if loss_plat == 'EXT' else var_page
+                                                if _m10_loss_page is not None:
+                                                    _m10_min_hint = _m10_loss_page.locator("text=/minimum trade size/i").first.inner_text(timeout=800)
+                                                    _m10_min_qty, _m10_min_coin = _m10_guard.parse_min_trade_size(_m10_min_hint)
+                                                    if _m10_min_qty > 0.0 and _m10_min_coin == str(coin0 or '').upper().strip():
+                                                        _M10_GUARD_STORE.learn_min_qty(loss_plat, coin0, _m10_min_qty, source='ui_hint')
                                             except Exception as _e:
-                                                _record_swallowed_exception('m10_step2_note_failed', _e)
-                                        try:
-                                            _m10_loss_page = ext_page if loss_plat == 'EXT' else var_page
-                                            if _m10_loss_page is not None:
-                                                _m10_min_hint = _m10_loss_page.locator("text=/minimum trade size/i").first.inner_text(timeout=800)
-                                                _m10_min_qty, _m10_min_coin = _m10_guard.parse_min_trade_size(_m10_min_hint)
-                                                if _m10_min_qty > 0.0 and _m10_min_coin == str(coin0 or '').upper().strip():
-                                                    _M10_GUARD_STORE.learn_min_qty(loss_plat, coin0, _m10_min_qty, source='ui_hint')
-                                        except Exception as _e:
-                                            _record_swallowed_exception('m10_step2_min_size_hint', _e)
-                                        _m10_rb_planned_u = float(step3_u)
-                                        step3_u = _m10_guard.rollback_restore_u(_pre_win_notional, _step1_fill_ratio)
-                                        step3_side = _a1_norm_side((pre_ext if win_plat == 'EXT' else pre_var).get('side') or '')
-                                        _m10_rb_mode = True
-                                        # The helper's 40U floor must never enlarge a tiny
-                                        # rollback beyond the portion actually closed.
-                                        _m10_rb_closed_u = max(0.0, float(_pre_win_notional or 0.0)) * max(0.0, min(float(_step1_fill_ratio or 0.0), 1.0))
-                                        if step3_u > _m10_rb_closed_u + 1e-9:
-                                            step3_detail['rollback_block_reason'] = 'restore_min40_exceeds_closed_notional'
-                                            step3_detail['rollback_candidate_u'] = float(step3_u)
-                                            step3_u = 0.0
-                                        step3_detail.update({
-                                            'rule': 'm10_step2_fail_rollback_restore_win_leg',
-                                            'planned_step3_u': _m10_rb_planned_u,
-                                            'reopen_u': float(step3_u), 'side': str(step3_side or ''),
-                                            'rollback_closed_u': float(_m10_rb_closed_u),
-                                            'rollback_fill_ratio': float(_step1_fill_ratio),
-                                        })
-                                        try:
-                                            safe_log(lambda: f"[M10][STEP2_FAIL_ROLLBACK] coin={coin0} win_plat={win_plat} loss_plat={loss_plat} close_u={float(close_u):.4f} planned_step3_u={_m10_rb_planned_u:.4f} restore_u={float(step3_u):.4f} side={step3_side} block={step3_detail.get('rollback_block_reason', '')}")
-                                        except Exception as _e:
-                                            _log_exc(mod='SYS', stage='EXC_PASS', e=_e)
+                                                _record_swallowed_exception('m10_step2_min_size_hint', _e)
+                                            _m10_rb_planned_u = float(step3_u)
+                                            _m10_rb_limit = _m10_execution.rollback_limit(_step1_pre,
+                                                _probe_read_leg(win_plat), _step1_probe_detail.get('closed_qty'))
+                                            step3_u = _m10_guard.rollback_restore_u(_pre_win_notional, _step1_fill_ratio)
+                                            if not _m10_rb_limit.get('ok'):
+                                                step3_u = 0.0
+                                                step3_detail['rollback_block_reason'] = _m10_rb_limit['reason']
+                                            else:
+                                                step3_u = min(step3_u, float(int(_m10_rb_limit['max_u'] // 10) * 10))
+                                            step3_detail['rollback_limit'] = _m10_rb_limit
+                                            step3_side = _a1_norm_side((pre_ext if win_plat == 'EXT' else pre_var).get('side') or '')
+                                            _m10_rb_mode = True
+                                            # The helper's 40U floor must never enlarge a tiny
+                                            # rollback beyond the portion actually closed.
+                                            _m10_rb_closed_u = max(0.0, float(_pre_win_notional or 0.0)) * max(0.0, min(float(_step1_fill_ratio or 0.0), 1.0))
+                                            if step3_u > _m10_rb_closed_u + 1e-9 or 0.0 < step3_u < 40.0:
+                                                step3_detail['rollback_block_reason'] = 'restore_min40_exceeds_closed_notional'
+                                                step3_detail['rollback_candidate_u'] = float(step3_u)
+                                                step3_u = 0.0
+                                            step3_detail.update({
+                                                'rule': 'm10_step2_fail_rollback_restore_win_leg',
+                                                'planned_step3_u': _m10_rb_planned_u,
+                                                'reopen_u': float(step3_u), 'side': str(step3_side or ''),
+                                                'rollback_closed_u': float(_m10_rb_closed_u),
+                                                'rollback_fill_ratio': float(_step1_fill_ratio),
+                                            })
+                                            try:
+                                                safe_log(lambda: f"[M10][STEP2_FAIL_ROLLBACK] coin={coin0} win_plat={win_plat} loss_plat={loss_plat} close_u={float(close_u):.4f} planned_step3_u={_m10_rb_planned_u:.4f} restore_u={float(step3_u):.4f} side={step3_side} block={step3_detail.get('rollback_block_reason', '')}")
+                                            except Exception as _e:
+                                                _log_exc(mod='SYS', stage='EXC_PASS', e=_e)
                                     elif ok2:
                                         try:
                                             _M10_GUARD_STORE.clear_failed(loss_plat, coin0)
                                         except Exception as _e:
                                             _record_swallowed_exception('m10_step2_clear_failed', _e)
+                                    _step3_start = _m10_attempt_count()
                                     if (ok2 or _m10_rb_mode) and (step3_u >= 10.0) and step3_side:
                                         _step3_t0 = time.time()
                                         try:
@@ -98284,16 +98410,24 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                             _step3_pre = {'position_state': 'UNAVAILABLE'}
 
                                         def _step3_do_open(_attempt_tag: str) -> tuple[bool, dict]:
+                                            _attempt_start = _m10_attempt_count()
                                             _det = {'attempt': str(_attempt_tag or ''), 'submit_ok': False,
                                                     'pre_position': copy.deepcopy(_step3_pre), 'submit_attempted': False}
                                             try:
+                                                if _step3_pre.get('position_state') not in ('FOUND', 'CONFIRMED_EMPTY'):
+                                                    return False, dict(_det, state='failed', reason='step3_pre_position_unavailable', retry_allowed=False)
+                                                _blocker3 = _safety_pending_scope(win_plat, coin0)
+                                                if _blocker3:
+                                                    return False, dict(_det, state='failed', reason='blocked_existing_unconfirmed_no_submit', blocker=_submission_blocker_detail(_blocker3), retry_allowed=False)
                                                 order3 = _ExecOrder(platform=('ext' if win_plat=='EXT' else 'var'), coin=coin0, side=side3, usd=float(step3_u), reduce_only=False)
                                                 try:
                                                     _exec_attach_order_ctx(order3, req)
                                                 except Exception as _e:
                                                     _record_swallowed_exception('except_pass_line_1575', _e)
                                                     pass
-                                                _det['submit_attempted'] = exe3 is not None
+                                                if _m10_rb_mode:
+                                                    order3.meta['m10_rollback_max_u'] = float(step3_u)
+                                                _det['submit_attempted'] = False
                                                 _det['submit_ok'] = bool(_exe_open_position_safe(exe3, order3, dry_run=False, plat=str(win_plat), act="open_position")) if exe3 is not None else False
                                                 _order_meta = getattr(order3, 'meta', None)
                                                 _det['definitive_reject'] = bool(isinstance(_order_meta, dict) and (_order_meta.get('definitive_reject') is True or _order_meta.get('confirmed_fail') is True))
@@ -98321,14 +98455,14 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                                 _confirmed, _confirm = False, {'reason': 'step3_confirmation_exception', 'err': repr(e)}
                                             _det['confirm'] = _confirm
                                             _det['probe_ok'] = bool(_confirmed)
-                                            try:
-                                                _pending_scope = _safety_pending_scope(win_plat, coin0)
-                                            except Exception as e:
-                                                _pending_scope = {'reason': 'submission_journal_unavailable', 'err': repr(e)}
-                                            _ambiguous = bool(_pending_scope or _det.get('submit_exception') or float(_confirm.get('actual_delta_qty') or 0.0) > 0.0)
-                                            _det['state'] = ('confirmed' if _confirmed else
-                                                'pending' if _ambiguous or (_det['submit_ok'] and not _det.get('definitive_reject')) else 'failed')
-                                            if _det['state'] == 'pending':
+                                            _attempts = _m10_attempts_since(_attempt_start)
+                                            _det['submission_attempts'] = _attempts
+                                            _det['submit_attempted'] = any(a.get('state') in _m10_execution.SENT for a in _attempts)
+                                            _det['state'] = _m10_execution.outcome(_attempts, confirmed=_confirmed,
+                                                delta_qty=_confirm.get('actual_delta_qty'), reported=_det['submit_ok'])
+                                            _det['retry_allowed'] = (_det['state'] == 'failed' and not _det['submit_attempted']
+                                                and not _safety_pending_scope(win_plat, coin0))
+                                            if _det['state'] == 'pending' and _det['submit_attempted']:
                                                 try:
                                                     _det['confirmation_key'] = _m10_step3_track_unconfirmed(win_plat, coin0, step3_side, step3_u, _step3_pre)
                                                 except Exception as e:
@@ -98343,7 +98477,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                         ok3, _step3_try1 = _step3_do_open('try1')
                                         step3_detail['attempt1'] = _step3_try1
                                         _m10_step3_state = _step3_try1['state']
-                                        if _m10_step3_state == 'failed':
+                                        if _m10_step3_state == 'failed' and _step3_try1.get('retry_allowed'):
                                             try:
                                                 if page3 is not None:
                                                     if win_plat == 'EXT':
@@ -98366,6 +98500,7 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                         step3_detail['skip_reason'] = 'step2_not_ok_or_invalid_step3'
 
                                     step3_detail['state'] = _m10_step3_state
+                                    step3_detail['submission_attempts'] = _m10_attempts_since(_step3_start)
                                     try:
                                         safe_log(lambda: f"[M10][STEP3] coin={coin0} win_plat={win_plat} ok={bool(ok3)} reopen_u={float(step3_u):.4f} side={step3_side}")
                                     except Exception as _e:
@@ -98398,26 +98533,14 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                                             pending_kind='step3_unconfirmed', state='step3_unconfirmed',
                                             blocking=True, ttl_sec=180.0, owner='step3_unconfirmed')
                                     else:
-                                        try:
-                                            _m10_reopen_mark_pending(coin0, platform=win_plat, side=step3_side, amount_u=float(step3_u or 0.0), reason=('m10_retry_step2_then_step3_pending' if not ok2 else 'm10_step3_reopen_fail'), source_mod='M10', req_id=str(_m10_req_meta0.get('req_id') or ''), trace_id=str(_m10_req_meta0.get('trace_id') or _m10_req_meta0.get('trace') or ''), pending_kind=('retry_step2_then_step3' if not ok2 else 'step3_reopen'), state=('retry_step2_then_step3' if not ok2 else 'step3_reopen'), blocking=(False if not ok2 else True), ttl_sec=(90.0 if not ok2 else 180.0), last_fail_reason=(str(step3_detail.get('skip_reason') or 'step2_not_ok_or_invalid_step3') if not ok2 else 'm10_step3_reopen_fail'), owner=('step3_fail' if ok2 else 'step2_fail'))
-                                        except Exception as _e:
-                                            _record_swallowed_exception('except_pass_line_1579', _e)
-                                            pass
-                                        try:
-                                            _legacy_deleted_after_failure(_m10_snapshot_ctx, coin0, win_plat, step3_side, float(step3_u or 0.0), ('m10_retry_step2_then_step3' if not ok2 else 'm10_step3_reopen_fail'), source_mod='M10')
-                                        except Exception as e:
-                                            try:
-                                                step3_detail['auto_legacy_deleted_submit_err'] = repr(e)
-                                            except Exception as _e:
-                                                _record_swallowed_exception('except_pass_line_1580', _e)
-                                                pass
-                                        try:
-                                            step3_detail['legacy_deleted_pending'] = True
-                                        except Exception as _e:
-                                            _record_swallowed_exception('except_pass_line_1581', _e)
-                                            pass
+                                        _m10_record_recovery_required(coin0, win_plat, step3_side, step3_u,
+                                            _step1_pre, _step1_probe_detail, reason='m10_restore_not_submitted_or_failed')
+                                        step3_detail['recovery_required'] = True
+                                        safe_log(lambda: f"[M10][RECOVERY_REQUIRED] coin={coin0} platform={win_plat} side={step3_side} closed_qty={_step1_probe_detail.get('closed_qty')} restore_u={step3_u} state={_m10_step3_state} no_legacy_submit=1")
                                     ok = bool(ok1 and ok2 and ok3)
                                     reason = "ok" if ok else f"tp_koujing_fail:step1={bool(ok1)} step2={bool(ok2)} step3={bool(ok3)}"
+                                    if _step2_state == 'pending':
+                                        reason += ' step2=unconfirmed'
                                     if _m10_step3_state == 'pending':
                                         reason += " step3=unconfirmed"
                                     if _m10_rb_mode:
@@ -98832,7 +98955,11 @@ def executor_run_quanbu(cdp: str, log_path: str, snapshot: dict, requests: list,
                             _rr_exec = _safety_apply_confirmation_fields(dict(_rr_exec, ok=False, submit_ok=True,
                                 pending=True, pending_confirm=True, confirmed_fail=False,
                                 definitive_reject=False, postcheck_ok=False))
-                            _rr_exec['reason'] = str(reason)  # Preserve the M10 prefix and unconfirmed suffix.
+                        else:
+                            _rr_exec = _safety_apply_confirmation_fields(dict(_rr_exec, ok=bool(ok),
+                                postcheck_ok=bool(ok), confirmed_fail=not bool(ok),
+                                pending=False, pending_confirm=False))
+                        _rr_exec['reason'] = str(reason)  # Preserve the M10 prefix and unconfirmed suffix.
                 except Exception as _e:
                     _record_swallowed_exception('except_pass_line_1593', _e)
                     pass
